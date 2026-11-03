@@ -386,6 +386,9 @@ static void watch_install(void) {
     LOG("write watch on %#llx + %#llx (host page %#llx)", (unsigned long long)g_wat, (unsigned long long)g_wlen, (unsigned long long)g_wpg);
 }
 
+#else
+// iOS has no probes (DM_PROBE is Mac-only): the control file's "probewin" (hle_hid.c) only says so
+void dm_probe_window(uint64_t n) { (void)n; LOG("DM_CTL probewin: no probes on iOS"); }
 #endif
 
 void probe_install(void) {
