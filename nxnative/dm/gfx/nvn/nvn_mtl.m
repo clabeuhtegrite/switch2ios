@@ -2208,7 +2208,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> base, MTLTextur
     d.storageMode = base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
     d.resourceOptions = base.resourceOptions; d.usage = base.usage | add | (tex_atomic_capable(base) ? MTLTextureUsageShaderAtomic : 0);   // the usage property leaves the atomic usage out
     id srt = objc_getAssociatedObject(base, &g_srt_key);   // a sparse render target stays one: the new texture maps the same tiles, nothing to copy (srt_adopt)
-    if (srt) d.placementSparsePageSize = MTLSparsePageSize64;
+    if (srt) { d.placementSparsePageSize = MTLSparsePageSize64; d.allowGPUOptimizedContents = NO; }
     // A linear texture aliases the guest pool. Adding usage must keep that backing: a new standalone texture copies the old pixels once, but later GPU writes never reach the CPU map.
     id<MTLBuffer> backing = base.buffer;
     id<MTLTexture> upgraded = backing ? [backing newTextureWithDescriptor:d offset:base.bufferOffset bytesPerRow:base.bufferBytesPerRow] : [g_dev newTextureWithDescriptor:d];
@@ -2831,6 +2831,9 @@ static id<MTLTexture> srt_make(const tex_t *t, MTLTextureDescriptor *d) {
     MTLTextureDescriptor *sd = [d copy];
     sd.storageMode = MTLStorageModePrivate; sd.hazardTrackingMode = MTLHazardTrackingModeUntracked; sd.placementSparsePageSize = MTLSparsePageSize64;
     sd.usage |= MTLTextureUsagePixelFormatView;   // a format view would remake it (tex_upgrade)
+    // Their physical pages can be shared across formats (Mario Kart World's 8 R8 and RG16 targets of 341 MB look to share two pools of 343 MB), so no GPU-private layout or compression:
+    // a Metal tile holds plain texels whichever texture drew them (tex_upgrade keeps it so)
+    sd.allowGPUOptimizedContents = NO;
     id<MTLTexture> mt = [g_dev newTextureWithDescriptor:sd];
     if (!mt) { RED_ONCE(924, "no sparse render target for %ux%ux%u format %#x target %d: made whole", t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target); return nil; }
     NvSparseRT *e = [NvSparseRT new];
