@@ -731,13 +731,17 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                  (u64{(high_result ? high : low) + 216} << 8) | (u64{insn.words[1]} << 20));
             break;
         }
-        case 0xb82: { // LDC.64 indexed byte offset
-            const u32 width = insn.Bits(73, 3);
-            if ((width != 4 && width != 5) || insn.Bits(78, 2) || insn.Bits(91, 1) ||
-                bank() >= 18 ||
-                (width == 5 && ((dest & 1) || dest >= 254))) return fail(index, "native indexed constant load mode");
+        case 0xb82: { // LDC indexed byte offset
+            // Sizes (bits 73-75: U8, S8, U16, S16, 32, 64) and modes (bits 78-79: indexed, .IL, .IS, .ISL) have Maxwell's codes (NAK sm70_encode.rs: MemType, LdcMode), which the Maxwell
+            // frontend reads at bits 48-50 and 44-45. Mario Kart World's DriveRefreshUber vertex shaders were rejected here (32 / 64 bits only, no mode). Bit 91 takes the bank from a
+            // uniform register (bindless), which Maxwell's LDC cannot
+            const u32 width = insn.Bits(73, 3), mode = insn.Bits(78, 2);
+            if (insn.Bits(91, 1)) return fail(index, "native indexed constant load mode (bank from a uniform register)");
+            if (width > 5) return fail(index, "native indexed constant load mode (128-bit)");
+            if (bank() >= 18) return fail(index, "native indexed constant load mode (bank)");
+            if (width == 5 && ((dest & 1) || dest >= 254)) return fail(index, "native indexed constant load mode (64-bit destination)");
             emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
-                 (u64{insn.Bits(38, 16)} << 20) | (u64{bank()} << 36) | (u64{width} << 48));
+                 (u64{insn.Bits(38, 16)} << 20) | (u64{bank()} << 36) | (u64{mode} << 44) | (u64{width} << 48));
             break;
         }
         case 0xf89: { // SHFL with immediate lane and segmentation/clamp mask, any mode.
