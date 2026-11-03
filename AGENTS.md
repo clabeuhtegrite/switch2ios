@@ -22,9 +22,13 @@ switch2mac builds native Mac apps of Nintendo Switch 2 games from the user's own
 ./switch2mac.py run [VAR=value ...]
 ./switch2mac.py refresh
 ./switch2mac.py install
+./switch2mac.py run --phone [VAR=value ...]
+./switch2mac.py ios [--xcode]
 ```
 
 - **`run`**: runs the build from `work/` with a log in `work/logs/`, and writes control commands to `work/run/ctl.txt`.
+- **`run --phone`**: the iPhone app's switches (`games/<game>/env_ios.txt`) and launcher defaults, with memory statistics (`work/logs/memstat-*.tsv`) and address regions (`regions-*.tsv`): the phone's settings tried on the Mac (docs/ios.md).
+- **`ios`**: the iPhone app (unsigned IPA for LiveContainer, or `--xcode` for a project to sign). It compiles the shaders for iOS as well, so it is a slow step: ask first.
 - **App log:** `~/Library/Logs/nxnative/<title ID>.log`.
 - **Performance summary:** `tools/perf.sh [log]`.
 - **Shared pipeline list:** `tools/pipelines.py new` / `merge` (docs/porting.md § 4b).

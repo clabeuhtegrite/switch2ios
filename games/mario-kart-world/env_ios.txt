@@ -1,0 +1,11 @@
+# The iPhone app's switches: switch2mac.py ios packs them into the app (dm/env.txt), and switch2mac.py run --phone uses them on the Mac, to try the phone's settings there first.
+# On the phone, Documents/env.txt overrides any of them with no rebuild (one KEY=VALUE per line, # starts a comment). docs/ios.md says what each is for.
+# Memory statistics every second (memstat.m): Documents/memstat.tsv on the phone
+DM_MEMSTAT=memstat.tsv
+# The largest block of address space the app can reserve, logged at start: whether LiveContainer passes on the extended virtual addressing entitlement
+DM_VA_PROBE=1
+# The guest memory layout for a phone, from the measuring runs on the Mac (docs/ios.md, "Fitting into a phone's memory"). Unset, the profile's 20 GB block is reserved, which only an
+# app with extended virtual addressing can do. Sizes in bytes, or whole K / M / G
+#DM_ALIAS_SIZE=3G
+#DM_HEAP_REGION=2G
+#DM_APP_POOL=2G

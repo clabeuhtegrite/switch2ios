@@ -11,3 +11,5 @@ __pycache__/
 nxnative/dm/host/dmhost
 nxnative/dm/host/gen/
 nxnative/dm/gfx/tools/nx2_lower/nx2_lower
+*.ipa
+*.ipa.idx

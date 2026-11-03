@@ -12,9 +12,10 @@ Title ID `0400C3F00006E000`. Profile: [`nxnative/dm/games/0400C3F00006E000`](../
 | File | What |
 |---|---|
 | `game.json` | title ID, name, version and RomFS marker: how `switch2mac.py` knows this game |
-| `launcher.py` | writes the app's settings list (`Resources/dm/launcher.json`): nxnative's generic settings plus Performance overlay, Performance mode and this game's defaults |
+| `launcher.py` | writes the app's settings list (`Resources/dm/launcher.json`): nxnative's generic settings plus Performance overlay, Performance mode and this game's defaults; with `ios`, the iPhone app's (handheld by default) |
 | `runtime_shaders.tsv` | where each of the 317 shaders the game builds at run time sits in the dump (file, offset, size, checked by its key); `build` extracts them so the first launch has no black screen, black minimap, frozen intro movie or missing models |
 | `env.txt` | switches baked into the app (`DM_FPS=60`: frame pacing statistics fixed at 60 so macOS's 30 Hz power-saving pacing never starts) |
+| `env_ios.txt` | switches baked into the iPhone app (memory statistics, the address-space probe, the phone's memory layout once measured); `run --phone` uses them on the Mac ([docs/ios.md](../../docs/ios.md)) |
 
 ## Known issues
 

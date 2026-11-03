@@ -26,8 +26,31 @@ static uint8_t *g_alias; static size_t g_alias_cap;
 static _Atomic uint64_t *g_alias_bits;   // alias region page bitmap (alias_pages)
 static uint64_t *g_alias_exposed;   // one bit per host page ever opened; protected by g_map_lock
 static uint8_t *g_stack; static size_t g_stack_cap;
+static size_t g_app_pool;          // the application memory pool the game is told: the profile's app_pool, or DM_APP_POOL
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < g_reserve; }
+
+// A size switch of the guest layout: bytes (decimal or 0x hex), or whole K / M / G (DM_APP_POOL=4G); 0 when unset. At least min, in whole units of align
+static size_t env_size(const char *name, size_t min, size_t align) {
+    const char *s = getenv(name);
+    if (!s || !*s) return 0;
+    char *end; unsigned long long v = strtoull(s, &end, 0); int sh = 0;
+    switch (*end) { case 'G': case 'g': sh = 30; end++; break; case 'M': case 'm': sh = 20; end++; break; case 'K': case 'k': sh = 10; end++; break; default: break; }
+    if (*end || v > (~0ull >> sh) || (v << sh) < min || ((v << sh) & (align - 1)))
+        die("%s=%s: at least %zu MB, in whole %zu KB units (bytes, or whole K / M / G)", name, s, min >> 20, align >> 10);
+    return (size_t)(v << sh);
+}
+// The largest block this process can reserve in one piece, in 256 MB steps up to 1 TB (a binary search with PROT_NONE maps, which take no memory). iOS gives an app about 6 GB in one
+// piece without the extended virtual addressing entitlement, far more with it; under LiveContainer the guest app has LiveContainer's entitlements, so this is how to tell on the phone
+static size_t va_probe(void) {
+    size_t lo = 0, hi = (size_t)1 << 40;
+    while (hi - lo > 0x10000000) {
+        size_t mid = (lo + (hi - lo) / 2) & ~(size_t)0xfffffff;
+        void *p = mmap(NULL, mid, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) hi = mid; else { munmap(p, mid); lo = mid; }
+    }
+    return lo;
+}
 
 static void *alias_windows_thread(void *arg);
 static void *regions_thread(void *arg);
@@ -39,11 +62,24 @@ static void mem_init_once(void) {
         die("guest address-space profile has invalid native boundaries");
     // DM_ALIAS_SIZE=<bytes>: an alias region of that size instead of the profile's, the heap and stacks as they are; the block grows with it. A Switch-sized one (64 GB) holds what
     // a game reserves unchanged, for measuring its address regions on the Mac (the NSP script's heap check); an iPhone has no room for more than the profile's
-    size_t alias = DM_GAME_MEM_ALIAS; const char *as = getenv("DM_ALIAS_SIZE");
-    if (as && *as) { alias = (size_t)strtoull(as, NULL, 0); if (alias < 0x10000000 || (alias & (pg - 1))) die("DM_ALIAS_SIZE %s: at least 256 MB, in whole host pages", as); }
-    g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
+    size_t alias = DM_GAME_MEM_ALIAS, heap = RESERVE - 0x10000000 - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK, v;
+    if ((v = env_size("DM_ALIAS_SIZE", 0x10000000, pg))) alias = v;
+    // DM_HEAP_REGION / DM_APP_POOL: a heap region and an application pool of that size instead of the profile's, the block shrinking or growing with the heap region. For fitting a game
+    // made for a larger console into a phone (Mario Kart World's profile: a 9.5 GB heap region and a 9.55 GB pool on a 20 GB block, where an iPhone without the extended virtual
+    // addressing entitlement reserves at most about 6 GB and gives an app about 6 GB of memory): the game sizes its heap from the pool it is told (SetHeapSize below), and whether it
+    // runs with less is what a measuring run on the Mac shows. hle_nvn.c's sparse-pool threshold keeps the profile's pool
+    if ((v = env_size("DM_HEAP_REGION", 0x10000000, pg))) heap = v;
+    g_app_pool = DM_GAME_APP_POOL;
+    if ((v = env_size("DM_APP_POOL", 0x10000000, 0x100000))) g_app_pool = v;
+    g_reserve = 0x10000000 + alias + DM_GAME_MEM_STACK + heap;   // the profile's RESERVE when nothing is set
+    const char *vp = getenv("DM_VA_PROBE");
+    if (vp && *vp == '1') LOG("[mem] address space: one block of up to %.2f GB can be reserved (DM_VA_PROBE)", va_probe() / 1073741824.0);
     g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (g_as == MAP_FAILED) die("reserve guest AS");
+    if (g_as == MAP_FAILED) {
+        int err = errno;
+        die("reserve guest AS: %.2f GB (errno %d), and this process can reserve %.2f GB in one piece; iOS without the extended virtual addressing entitlement reserves about 6 GB at most: "
+            "DM_ALIAS_SIZE / DM_HEAP_REGION make the block smaller", g_reserve / 1073741824.0, err, va_probe() / 1073741824.0);
+    }
     // Fixed partition (all inside the reserved block): alias 2.875 GB, stack 256 MB, heap the remaining 1.625 GB.
     // In newer SDKs the AddressRegionManager always takes 0x3fe00000 (~1 GB) at the start of the alias region as its node area (sdk 0x134728) before handing out regions; with a 512 MB alias region the very first AllocateAddressRegion fails (0x1803).
     // SMBW also defines a 1792000 KB (1.75 GB) VirtualAddressMemory in HeapDef (System/HeapSize): it is subtracted from the memory pool before the heap is opened (SetHeapSize asks for only 0x5be00000),
@@ -56,6 +92,10 @@ static void mem_init_once(void) {
     if (!(g_alias_bits = calloc((g_alias_cap >> 18) + 1, sizeof *g_alias_bits))) die("alias region page bitmap calloc");
     if (!(g_alias_exposed = calloc(g_alias_cap / pg / 64 + 1, sizeof *g_alias_exposed))) die("alias exposure bitmap calloc");
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)g_reserve, g_heap, g_alias, g_stack);
+    LOG("[mem] guest block %.2f GB: alias region %.2f GB%s, stacks %.2f GB, heap region %.2f GB%s; application pool %.2f GB%s", g_reserve / 1073741824.0,
+        g_alias_cap / 1073741824.0, alias != DM_GAME_MEM_ALIAS ? " (DM_ALIAS_SIZE)" : "", g_stack_cap / 1073741824.0,
+        g_heap_cap / 1073741824.0, g_heap_cap != RESERVE - 0x10000000 - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK ? " (DM_HEAP_REGION)" : "",
+        g_app_pool / 1073741824.0, g_app_pool != DM_GAME_APP_POOL ? " (DM_APP_POOL)" : "");
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
     const char *rf = getenv("DM_REGIONS");
@@ -70,7 +110,7 @@ static void mem_init(void) {
 // and hands the whole block to its own StandardAllocator (main+0x32137a0) -- so heap size = pool − image footprint, it has only as much as the host reports.
 // Previously 3 GB was reported here and SetHeapSize never failed: the heap was about 150 MB smaller than on the real device, at the run entry peak the main heap had only about 18 MB left, and under high local load a timing shift made a 128 KB request return null,
 // which the guest writes to without a null check (CRASH main+0x1b36138, re-verified after merge with inv_tap).
-#define APP_POOL DM_GAME_APP_POOL   // game profile app_pool (Mario 0xCD500000)
+#define APP_POOL g_app_pool   // game profile app_pool (Mario 0xCD500000), or DM_APP_POOL (mem_init); read only after mem_init
 static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro) n += g_mod[i].size;   // an NRO lives in memory the game allocated (its image and bss buffers)
     return (n + 0x1fffff) & ~(size_t)0x1fffff; }
 // Giant bss (modules with the patch area before the base, patch_nso.py FAR): the image bytes beyond the file part. Used memory was reported as "heap + 64 MB", where the 64 MB covers ordinary modules' code and data (Mario's two modules are about 74 MB together,

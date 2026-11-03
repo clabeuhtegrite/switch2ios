@@ -101,6 +101,10 @@ If something still looks missing after a while (a shader the list does not cover
 
 Controllers map by position (right button = A, bottom = B, top = X, left = Y; Nintendo pads by label). Keyboard: WASD left stick, arrow keys D-pad, J K U I = A B X Y, Q E = L R, Z C = ZL ZR, Return = +, Tab = −, F / G stick presses, 1 overlay, 2 settings, ⌃⌘F full screen, ⌘Q quit. The mouse is the touchscreen.
 
+## iPhone (in progress)
+
+`./switch2mac.py ios` builds an iPhone app from the same build (an unsigned IPA for LiveContainer, or `--xcode` for a project to sign yourself), for the iPhone 17 Pro, 18 Pro and Duo. Nothing has run on a phone yet: the game uses far more memory than an iPhone gives an app, and fitting it is the work in progress. `./switch2mac.py run --phone` tries the phone's settings on the Mac first. See [docs/ios.md](docs/ios.md).
+
 ## Other game versions
 
 Only 1.0.0 is tested. `build` checks the dump's build ID and stops on any other version, because the profile ([`nxnative/dm/games/0400C3F00006E000/game.tsv`](nxnative/dm/games/0400C3F00006E000/game.tsv)) names the exact modules and build IDs it rewrites. To try an update, see [games/mario-kart-world/README.md](games/mario-kart-world/README.md#other-versions); expect new problems.
@@ -120,12 +124,12 @@ The runtime is [nxnative](https://github.com/seedds/nxnative): it loads the game
 
 | Path | What |
 |---|---|
-| `switch2mac.py` | setup, build, run, refresh, install |
-| `games/<game>/` | one folder per game: `game.json` (title ID, name, version), the app's settings (`launcher.py`, `env.txt`), the run-time shader list (`runtime_shaders.tsv`) and notes |
+| `switch2mac.py` | setup, build, run, refresh, install, ios |
+| `games/<game>/` | one folder per game: `game.json` (title ID, name, version), the app's settings (`launcher.py`, `env.txt`; the iPhone app's `env_ios.txt`), the run-time shader list (`runtime_shaders.tsv`) and notes |
 | `tools/` | the shared pipeline list helper (`pipelines.py`), porting helpers: run-time shader finder, NSO disassembly helper, pass tracer, performance summary |
-| `nxnative/` | the runtime and tools: nxnative with switch2mac's Switch 2 changes (upstream's iOS app sources are kept because the shader tools share them) |
+| `nxnative/` | the runtime and tools: nxnative with switch2mac's Switch 2 changes (upstream's iOS app sources, which the shader tools share and `ios` builds) |
 | `nxnative/dm/games/<title ID>/` | the game profile: build IDs, memory layout, shader tables |
-| `docs/` | [porting.md](docs/porting.md) (bringing up a game), [mario-kart-world.md](docs/mario-kart-world.md) (how the first port was made) |
+| `docs/` | [porting.md](docs/porting.md) (bringing up a game), [mario-kart-world.md](docs/mario-kart-world.md) (how the first port was made), [ios.md](docs/ios.md) (the iPhone app) |
 | `AGENTS.md` | notes for AI coding assistants |
 | `CHANGELOG.md` | what changed, release by release |
 
