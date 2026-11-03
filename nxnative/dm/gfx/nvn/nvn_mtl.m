@@ -11953,6 +11953,7 @@ void dm_gfx_shot_burst(long n, const char *dir) {
     void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(n + 2);
     MLOG("burst: %ld screenshots into %s (frame now %llu)", n, dir, (unsigned long long)atomic_load(&g_cur_frame));
 }
+int dm_gfx_shots_pending(void) { pthread_mutex_lock(&g_shotq_mu); int n = g_nshotq; pthread_mutex_unlock(&g_shotq_mu); return n; }   // screenshots still queued (key 3's burst, front_mac.m)
 // DM_NVN_SHOT_OUT=WIDTHxHEIGHT (for picture quality metrics): the present-frame screenshot instead captures the result "upscaled to this resolution by the present pass", i.e. the picture the player sees on a screen
 // of that size (with DM_PRESENT_UPSCALE=metalfx through MetalFX, on the Metal 4 queue: present_offscreen_m4); screen=0 (texture dump) is unaffected
 static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]) {

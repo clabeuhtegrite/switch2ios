@@ -438,13 +438,26 @@ static void overlay_cycle(void) {
 }
 // Key 3: a screenshot of the picture as shown, to point at a problem while playing: the next presented frame at the window's size (nvn_mtl.m mtl_grab_next_present), as a
 // PNG in DM_SHOT_DIR, else <DM_ROOT>/logs/shots (work/logs/shots for switch2mac.py run, the Application Support folder's for the app), else ~/Pictures. Its log line places it
-// among the frame lines. One at a time: a second press before the next present replaces the first
+// among the frame lines. One at a time: a second press before the next present replaces the first.
+// DM_SHOT_BURST=<n> (diagnostic, 1-64): key 3 takes a burst instead, the next n presented frames as PNGs in a folder of their own (burst-<time>), with the pass dump of those
+// frames in the log (nvn_mtl.m dm_gfx_shot_burst; DM_NVN_PASSDUMP_ALL=1 records every draw), so the frames where an object is missing can be set against those where it is
+// drawn. The game runs slowly meanwhile; a press while a burst is still being taken is ignored
 void mtl_grab_next_present(void (^cb)(CGImageRef img));
+void dm_gfx_shot_burst(long n, const char *dir); int dm_gfx_shots_pending(void);
 static void key_shot(void) {
     const char *d = getenv("DM_SHOT_DIR"), *root = getenv("DM_ROOT");
     NSString *dir = d && *d ? @(d) : root && *root ? [@(root) stringByAppendingPathComponent:@"logs/shots"] : [NSHomeDirectory() stringByAppendingPathComponent:@"Pictures"];
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     NSDateFormatter *f = [NSDateFormatter new]; f.dateFormat = @"yyyyMMdd-HHmmss-SSS";
+    long burst = getenv("DM_SHOT_BURST") ? atol(getenv("DM_SHOT_BURST")) : 0;
+    if (burst > 0) {
+        if (dm_gfx_shots_pending()) { LOG("front end: burst (key 3) still being taken: press ignored"); return; }
+        NSString *bd = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"burst-%@", [f stringFromDate:NSDate.date]]];
+        [NSFileManager.defaultManager createDirectoryAtPath:bd withIntermediateDirectories:YES attributes:nil error:nil];
+        LOG("front end: burst of %ld frames (key 3) → %s", burst > 64 ? 64 : burst, bd.UTF8String);
+        dm_gfx_shot_burst(burst, bd.UTF8String);
+        return;
+    }
     NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"key-%@.png", [f stringFromDate:NSDate.date]]];
     LOG("front end: screenshot (key 3) of the next presented frame → %s", path.UTF8String);
     mtl_grab_next_present(^(CGImageRef img) {   // on a Metal completion thread
