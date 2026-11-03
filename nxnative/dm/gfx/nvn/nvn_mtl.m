@@ -6,15 +6,17 @@
 #undef I   // MetalFX brings in <complex.h>, whose I (the imaginary unit) would shadow the local tables named I below
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#include <TargetConditionals.h>
 #include <mach/mach_time.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#if TARGET_OS_OSX
+#include <mach/mach_vm.h>   // mach_vm_remap (readwatch's second mapping of a page); the iOS SDK has no mach_vm.h
+#endif
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <fcntl.h>
-#include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>   // os_proc_available_memory: for the memory readout line
 #endif
@@ -1452,9 +1454,12 @@ void dm_gfx_readwatch(uint64_t a, uint64_t n) {
     pthread_mutex_lock(&g_grw_mu);
     grw_slot *s = grw_find(a & ~(g_grw_psz - 1), 1);
     if (s && !s->alias) {   // a second, always accessible mapping of the same page, for grw_emulate
+#if TARGET_OS_OSX
         mach_vm_address_t al = 0; vm_prot_t cur, max;
         if (mach_vm_remap(mach_task_self(), &al, g_grw_psz, 0, VM_FLAGS_ANYWHERE, mach_task_self(), (mach_vm_address_t)(a & ~(g_grw_psz - 1)), FALSE, &cur, &max, VM_INHERIT_NONE) == KERN_SUCCESS) s->alias = al;
-        else MLOG("[readwatch] no second mapping of the page: accesses are sampled only");
+        else
+#endif
+        MLOG("[readwatch] no second mapping of the page: accesses are sampled only");   // iOS: no mach_vm_remap in its SDK
     }
     if (s) { s->mlo = a; s->mhi = a + n; s->fence = 0; atomic_store(&s->pending, 1); }
     pthread_mutex_unlock(&g_grw_mu);
@@ -10984,7 +10989,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "texture→buffer copy destination is in no memory pool"); return; }
     sbw_note(c->src, img * nz, SBW_GPU);
     // A combined depth / stencil texture copies one plane only, chosen by option (without it Metal copies nothing): the depth plane for a 4-byte texel, the stencil plane for a 1-byte one
-    MTLPixelFormat pf = t.pixelFormat; int ds = pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatDepth24Unorm_Stencil8;
+    MTLPixelFormat pf = t.pixelFormat; int ds = pf == MTLPixelFormatDepth32Float_Stencil8 || pf == (MTLPixelFormat)255;   // 255: Depth24Unorm_Stencil8, a name the iOS SDK lacks
     MTLBlitOption opt = !ds ? MTLBlitOptionNone : bpb == 1 ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil;
     { static uint64_t seen[64]; static int nseen; uint64_t key = (uint64_t)pf << 40 | (uint64_t)c->r.width << 20 | c->r.height; int i = 0;   // each kind of texture copied to memory, once
       while (i < nseen && seen[i] != key) i++;
