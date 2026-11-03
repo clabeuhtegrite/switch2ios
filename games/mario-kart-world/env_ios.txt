@@ -4,6 +4,14 @@
 DM_MEMSTAT=memstat.tsv
 # The largest block of address space the app can reserve, logged at start: whether LiveContainer passes on the extended virtual addressing entitlement
 DM_VA_PROBE=1
+# The memory switches measured on the Mac with run --phone (part D: footprint median 11.6 GB over title, race and free roam instead of 12.9, 60 fps, the picture unchanged; docs/ios.md):
+# textures deswizzled on the GPU from a copy of their storage, so their pools stay out of the residency set, which iOS wires whole
+DM_NVN_DESWZ_GPU=2
+# large sparse textures the game draws into get memory only for the 64 KB tiles it maps (Mario Kart World: 10 such textures, 3.1 GB when made whole)
+DM_NVN_SPARSE_RT=1
+# the terrain's sparse tiles the game unmaps give their memory back, and its tiles over the same physical tile share one Metal tile (heaps 4.4 GB -> 2.0 GB by the end of free roam)
+DM_NVN_SPARSE_FREE=1
+DM_NVN_SPARSE_SHARE=1
 # The guest memory layout for a phone, from the measuring runs on the Mac (docs/ios.md, "Fitting into a phone's memory"). Unset, the profile's 20 GB block is reserved, which only an
 # app with extended virtual addressing can do. Sizes in bytes, or whole K / M / G
 #DM_ALIAS_SIZE=3G
