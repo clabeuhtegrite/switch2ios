@@ -12517,5 +12517,118 @@ void mtl_wait_state_dump(void) {
          (unsigned long long)g_pq_in, (unsigned long long)g_pq_done, g_cb != nil, atomic_load(&g_sub_thread_set));
 }
 void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_alloc_waits; *grown = g_alloc_grown; *n = g_alloc_n; }   // Main submit allocator pool: how many times it waited, how many times it grew, how many exist now
+// ---------- Metal's memory by kind, for DM_MEMSTAT (host/memstat.m: columns every second, and <tsv>.textures at DM_MEMSTAT_DUMP) ----------
+// The GPU's part of the footprint is in no VM region of the process (memstat's "unattributed"), and Metal's currentAllocatedSize also counts the no-copy buffers over the memory
+// pools, which are guest memory. This splits what Metal holds by walking the residency set, where every allocation the GPU can reach is:
+//   pools resident: the pools' no-copy buffers in the residency set (guest memory the GPU addresses: on iOS their pages are wired whole, used or not, see pool_res)
+//   pools: every registered pool's buffer, resident or not       packaged textures: uploaded from a pool, a second copy of bytes the guest still holds
+//   other textures: render targets, GPU- and CPU-written textures, the host's own       heaps: sparse and placement heaps       buffers: upload staging, arenas, the host's own
+//   allocated: currentAllocatedSize (all of the above, plus what is not resident: the rest is pipelines and Metal's own)
+//   guest in pools: the pools' pages that are in memory or paged out (mincore), the part of memstat's guest charge that is GPU data (a virtual pool's mapped pages count again
+//   where it maps them)
+//   pipelines: render, mesh, compute and pulling pipelines and pulling bases built so far, a count (the tables are read without their locks: a count a moment old)
+// Bytes but the count. Called on the memstat thread; it takes g_mu, g_smu and g_res_mu one after the other, never two at once
+enum { MK_POOL_RES, MK_POOL_ALL, MK_PKG, MK_TEX, MK_HEAP, MK_BUF, MK_ALLOC, MK_GUEST_POOLS, MK_PSO, MK_N };
+#ifndef MINCORE_PAGED_OUT
+#define MINCORE_PAGED_OUT 0x20
+#endif
+static int mk_ptr_cmp(const void *a, const void *b) { uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b; return (x > y) - (x < y); }
+static int mk_ptr_in(const uintptr_t *v, int n, uintptr_t p) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) { int m = lo + (hi - lo) / 2; if (v[m] == p) return 1; if (v[m] < p) lo = m + 1; else hi = m - 1; }
+    return 0;
+}
+// The packaged textures' Metal textures (and the spares of re-uploads), sorted: what tells a packaged copy from another texture
+static uintptr_t *mk_pkg_textures(int *n) {
+    pthread_mutex_lock(&g_smu);
+    size_t cap = 2 * ((size_t)g_by_serial.n + g_ghost.n) + 2; uintptr_t *v = malloc(cap * sizeof *v); int k = 0;
+    const nvn_hmap *tables[2] = {&g_by_serial, &g_ghost};
+    for (int t = 0; t < 2 && v; t++)
+        for (uint32_t i = 0; i < tables[t]->cap && (size_t)k + 2 <= cap; i++) {
+            void *p = tables[t]->vals[i]; if (!p) continue;
+            id o = (__bridge id)p; if (![o isKindOfClass:[NvPkg class]]) continue;
+            NvPkg *g = (NvPkg *)o;
+            if (g->tex) v[k++] = (uintptr_t)(__bridge void *)g->tex;
+            if (g->spare) v[k++] = (uintptr_t)(__bridge void *)g->spare;
+        }
+    pthread_mutex_unlock(&g_smu);
+    if (v) qsort(v, (size_t)k, sizeof *v, mk_ptr_cmp);
+    *n = v ? k : 0; return v;
+}
+// The pools' buffers (sorted), their host page ranges and sizes, as registered now
+typedef struct { uintptr_t lo, hi; uint64_t len; int res; } mk_pool;
+static mk_pool *mk_pools(int *n, uintptr_t **bufs) {
+    pthread_mutex_lock(&g_mu);
+    int np = g_npool; mk_pool *p = malloc((size_t)(np ? np : 1) * sizeof *p); uintptr_t *b = malloc((size_t)(np ? np : 1) * sizeof *b);
+    for (int i = 0; p && b && i < np; i++) {
+        p[i] = (mk_pool){g_pools[i].base, g_pools[i].hi, g_pools[i].buf.length, g_pools[i].res};
+        b[i] = (uintptr_t)(__bridge void *)g_pools[i].buf;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!p || !b) { free(p); free(b); *n = 0; *bufs = NULL; return NULL; }
+    qsort(b, (size_t)np, sizeof *b, mk_ptr_cmp);
+    *n = np; *bufs = b; return p;
+}
+static int mk_range_cmp(const void *a, const void *b) { uintptr_t x = ((const mk_pool *)a)->lo, y = ((const mk_pool *)b)->lo; return (x > y) - (x < y); }
+int mtl_mem_kinds(uint64_t *out, int n) { @autoreleasepool {
+    uint64_t k[MK_N] = {0};
+    if (g_dev) {
+        int np = 0, nk = 0; uintptr_t *pb = NULL; mk_pool *pp = mk_pools(&np, &pb); uintptr_t *pk = mk_pkg_textures(&nk);
+        for (int i = 0; i < np; i++) { k[MK_POOL_ALL] += pp[i].len; if (pp[i].res) k[MK_POOL_RES] += pp[i].len; }
+        // Guest pages in the pools: the ranges merged first (a virtual pool's runs and the pools beside one another share host pages), then mincore over each
+        if (pp && np) {
+            qsort(pp, (size_t)np, sizeof *pp, mk_range_cmp);
+            size_t pg = vm_page_size, vcap = 0; char *vec = NULL; uintptr_t lo = 0, hi = 0;
+            for (int i = 0; i <= np; i++) {
+                uintptr_t a = i < np ? pp[i].lo & ~(uintptr_t)(pg - 1) : 0, e = i < np ? (pp[i].hi + pg - 1) & ~(uintptr_t)(pg - 1) : 0;
+                if (i < np && hi && a <= hi) { if (e > hi) hi = e; continue; }   // overlaps or touches the range being merged
+                if (hi > lo) {
+                    size_t npg = (hi - lo) / pg;
+                    if (npg > vcap) { free(vec); vec = malloc(npg); vcap = vec ? npg : 0; }
+                    if (vec && !mincore((void *)lo, hi - lo, vec))   // a pool gone meanwhile fails the call: left out of this sample
+                        for (size_t j = 0; j < npg; j++) if (vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) k[MK_GUEST_POOLS] += pg;
+                }
+                lo = a; hi = e;
+            }
+            free(vec);
+        }
+        pthread_mutex_lock(&g_res_mu); NSArray *all = g_res_objects ? g_res_objects.allObjects : @[]; pthread_mutex_unlock(&g_res_mu);
+        for (id o in all) {
+            if ([o conformsToProtocol:@protocol(MTLTexture)]) {
+                id<MTLTexture> t = o; if (t.parentTexture || t.buffer || t.heap) continue;   // a view, or storage counted as its buffer or heap
+                k[mk_ptr_in(pk, nk, (uintptr_t)(__bridge void *)t) ? MK_PKG : MK_TEX] += t.allocatedSize;
+            } else if ([o conformsToProtocol:@protocol(MTLBuffer)]) {
+                if (!mk_ptr_in(pb, np, (uintptr_t)(__bridge void *)o)) k[MK_BUF] += ((id<MTLBuffer>)o).allocatedSize;
+            } else if ([o conformsToProtocol:@protocol(MTLHeap)]) k[MK_HEAP] += ((id<MTLHeap>)o).size;
+        }
+        k[MK_ALLOC] = g_dev.currentAllocatedSize;
+        k[MK_PSO] = (uint64_t)g_pso.n + g_pso_nx2.n + g_pso_hy.n + g_cps.n + g_pbase.n;
+        free(pp); free(pb); free(pk);
+    }
+    for (int i = 0; i < n && i < MK_N; i++) out[i] = k[i];
+    return MK_N;
+} }
+// Every resident texture, heap and host buffer and every registered pool, one per line (memstat.m writes it to <tsv>.textures at DM_MEMSTAT_DUMP): which allocations make the GPU's part
+void mtl_mem_textures(FILE *f) { @autoreleasepool {
+    if (!f || !g_dev) return;
+    int np = 0, nk = 0; uintptr_t *pb = NULL; mk_pool *pp = mk_pools(&np, &pb); uintptr_t *pk = mk_pkg_textures(&nk);
+    fprintf(f, "kind\tMiB\twidth\theight\tdepth\tarray\tlevels\tsamples\tpixel format\ttexture type\tusage\tstorage mode\n");
+    pthread_mutex_lock(&g_res_mu); NSArray *all = g_res_objects ? g_res_objects.allObjects : @[]; pthread_mutex_unlock(&g_res_mu);
+    for (id o in all) {
+        if ([o conformsToProtocol:@protocol(MTLTexture)]) {
+            id<MTLTexture> t = o; if (t.parentTexture || t.buffer || t.heap) continue;
+            fprintf(f, "%s\t%.3f\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%#lx\t%lu\n", mk_ptr_in(pk, nk, (uintptr_t)(__bridge void *)t) ? "packaged" : "texture",
+                    t.allocatedSize / 1048576.0, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth, (unsigned long)t.arrayLength,
+                    (unsigned long)t.mipmapLevelCount, (unsigned long)t.sampleCount, (unsigned long)t.pixelFormat, (unsigned long)t.textureType, (unsigned long)t.usage, (unsigned long)t.storageMode);
+        } else if ([o conformsToProtocol:@protocol(MTLBuffer)]) {
+            id<MTLBuffer> b = o; if (mk_ptr_in(pb, np, (uintptr_t)(__bridge void *)b)) continue;
+            fprintf(f, "buffer\t%.3f\t%lu\t\t\t\t\t\t\t\t\t%lu\n", b.allocatedSize / 1048576.0, (unsigned long)b.length, (unsigned long)b.storageMode);
+        } else if ([o conformsToProtocol:@protocol(MTLHeap)]) {
+            id<MTLHeap> h = o; fprintf(f, "heap\t%.3f\t%lu\t\t\t\t\t\t\t\t\t%lu\n", h.size / 1048576.0, (unsigned long)h.usedSize, (unsigned long)h.storageMode);
+        }
+    }
+    for (int i = 0; i < np; i++) fprintf(f, "%s\t%.3f\t%#lx\n", pp[i].res ? "pool resident" : "pool", pp[i].len / 1048576.0, (unsigned long)pp[i].lo);
+    free(pp); free(pb); free(pk);
+} }
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #pragma clang attribute pop

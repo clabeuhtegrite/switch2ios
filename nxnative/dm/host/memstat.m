@@ -19,6 +19,10 @@
 #include "dm.h"
 
 void svc_guest_range(uint8_t **base, size_t *size);
+// nvn_mtl.m: Metal's memory by kind (mtl_mem_kinds: pools resident, all pools, packaged textures, other textures, heaps, other buffers, allocated, guest in pools, pipelines) and
+// every resident allocation one per line (mtl_mem_textures); a host built without the NVN layer has neither
+__attribute__((weak)) int mtl_mem_kinds(uint64_t *out, int n) { (void)out; (void)n; return 0; }
+__attribute__((weak)) void mtl_mem_textures(FILE *f) { (void)f; }
 enum { C_GUEST, C_CODE, C_MALLOC, C_GPU, C_STACK, C_FILE, C_OTHER, NC };
 static const char *k_cls[NC] = {"guest", "code", "malloc", "gpu", "stack", "file", "other"};
 
@@ -38,7 +42,8 @@ static int classify(vm_address_t a, const vm_region_submap_info_data_64_t *in) {
     return C_OTHER;
 }
 
-// DM_MEMSTAT_DUMP=seconds: at that second, write every VM region ≥1 MiB line by line to <tsv>.regions (for diagnosing the accounting method)
+// DM_MEMSTAT_DUMP=seconds: at that second, write every VM region ≥1 MiB line by line to <tsv>.regions (for diagnosing the accounting method), and every resident Metal allocation
+// and memory pool to <tsv>.textures (mtl_mem_textures; DM_CTL's "texmem <path>" writes the same at any moment)
 static void dump_regions(const char *path) {
     FILE *f = fopen(path, "w"); if (!f) return;
     fprintf(f, "start	size MiB	class	user_tag	share_mode	obj_id	ref_count	resident MiB	dirty MiB	swapped MiB	file\n");
@@ -85,21 +90,27 @@ static void sample(FILE *f, double t, id<MTLDevice> dev) {
             vi.internal >> 20, vi.compressed >> 20, (vi.ledger_tag_graphics_footprint + vi.ledger_tag_graphics_footprint_compressed) >> 20,
             (long long)(vi.limit_bytes_remaining >> 20));
     for (int c = 0; c < NC; c++) fprintf(f, "\t%llu/%llu/%llu", virt[c] >> 20, res[c] >> 20, bill[c] >> 20);
-    fprintf(f, "\t%llu\t%lld\n", sum >> 20, ((int64_t)fp - (int64_t)sum) >> 20);
+    fprintf(f, "\t%llu\t%lld", sum >> 20, ((int64_t)fp - (int64_t)sum) >> 20);
+    uint64_t mk[9] = {0}; mtl_mem_kinds(mk, 9);   // Metal by kind (all 0 without the NVN layer); mk[6], currentAllocatedSize, is metal_alloc above
+    fprintf(f, "\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", mk[0] >> 20, mk[1] >> 20, mk[2] >> 20, mk[3] >> 20, mk[4] >> 20, mk[5] >> 20, mk[7] >> 20, mk[8]);
     fflush(f);
 }
 
 static void *memstat_thread(void *p) {
     FILE *f = fopen((const char *)p, "w");
     if (!f) { LOG("memstat: cannot open %s", (const char *)p); return NULL; }
-    fprintf(f, "# unit MiB; kernel accounting internal / compressed / graphics ledger / headroom to the limit; class columns = virtual/resident/charged (deduplicated per object); charged total = Σ private charged; unattributed = phys_footprint − charged total\nseconds\tphys_footprint\tavailable\tmetal_alloc\tinternal\tcompressed\tgraphics\theadroom");
+    fprintf(f, "# unit MiB; kernel accounting internal / compressed / graphics ledger / headroom to the limit; class columns = virtual/resident/charged (deduplicated per object); charged total = Σ private charged; unattributed = phys_footprint − charged total; Metal by kind (nvn_mtl.m mtl_mem_kinds): the pools' no-copy buffers in the residency set / all of them (guest memory), packaged textures (copies of pool bytes), other textures, heaps, other buffers; guest_in_pools = the pools' pages in memory or paged out; pipelines = a count\nseconds\tphys_footprint\tavailable\tmetal_alloc\tinternal\tcompressed\tgraphics\theadroom");
     for (int c = 0; c < NC; c++) fprintf(f, "\t%s", k_cls[c]);
-    fprintf(f, "\tcharged total\tunattributed\n");
+    fprintf(f, "\tcharged total\tunattributed\tpools_resident\tpools_all\ttex_packaged\ttex_other\theaps\tbuffers\tguest_in_pools\tpipelines\n");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();   // The same device object as the graphics backend (the system default device singleton)
     uint64_t t0 = now_ns();
     const char *ds = getenv("DM_MEMSTAT_DUMP"); int dump_at = ds ? atoi(ds) : -1;
-    char dp[1100]; snprintf(dp, sizeof dp, "%s.regions", (const char *)p);
-    for (int sec = 0;; sec++) { sample(f, (now_ns() - t0) / 1e9, dev); if (sec == dump_at) dump_regions(dp); sleep(1); }
+    char dp[1100], tp[1100]; snprintf(dp, sizeof dp, "%s.regions", (const char *)p); snprintf(tp, sizeof tp, "%s.textures", (const char *)p);
+    for (int sec = 0;; sec++) {
+        sample(f, (now_ns() - t0) / 1e9, dev);
+        if (sec == dump_at) { dump_regions(dp); FILE *tf = fopen(tp, "w"); if (tf) { mtl_mem_textures(tf); fclose(tf); } }
+        sleep(1);
+    }
     return NULL;
 }
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Summary of a memory statistics file (DM_MEMSTAT): work/logs/memstat-*.tsv from ./switch2mac.py run --phone or --memstat, or Documents/memstat.tsv from the iPhone app.
 The host writes one line a second, in MiB (nxnative/dm/host/memstat.m): the process footprint (what iOS's memory limit counts), what iOS has left (iPhone only), Metal's
-allocations, and the footprint split by class: guest (the game's memory block), code, malloc (the host's heap), gpu (Metal / IOSurface regions), stack, file, other.
+allocations, and the footprint split by class: guest (the game's memory block), code, malloc (the host's heap), gpu (Metal / IOSurface regions), stack, file, other;
+then what Metal holds by kind: the memory pools' no-copy buffers (guest memory: the ones the GPU uses, and all), packaged textures (uploaded copies of pool bytes), other
+textures (render targets, GPU-written), heaps, other buffers, the pools' pages in memory, and the pipelines built (a count).
 
   tools/memstat.py [file] [--from S] [--to S] [--budget SIZE] [--every S]
 
@@ -16,6 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TOTALS = [('phys_footprint', 'footprint'), ('metal_alloc', 'Metal allocated'), ('compressed', 'compressed (kernel)'), ('graphics', 'graphics ledger (kernel)')]
 CLASSES = ['guest', 'code', 'malloc', 'gpu', 'stack', 'file', 'other']
+KINDS = [('pools_resident', 'Metal: pools in use by GPU'), ('pools_all', 'Metal: all pools'), ('tex_packaged', 'Metal: packaged textures'), ('tex_other', 'Metal: other textures'),
+         ('heaps', 'Metal: heaps'), ('buffers', 'Metal: other buffers'), ('guest_in_pools', 'guest pages in pools')]   # nvn_mtl.m mtl_mem_kinds (hosts from 2026-11-03 on)
 
 
 def size(s):   # bytes, or whole K / M / G, as the host's switches take them; returned in MiB
@@ -69,6 +73,9 @@ def main():
     for c in CLASSES:
         if c in rows[0]: line(f'charged: {c}', [r[c][2] for r in rows])
     if 'unattributed' in rows[0]: line('unattributed', [r['unattributed'] for r in rows])
+    if any(r.get('pools_all') for r in rows):
+        for k, name in KINDS: line(name, [r[k] for r in rows])
+        pso = [int(r['pipelines']) for r in rows]; print(f'{"pipelines (count)":28}{max(pso):>8}{"":7}{"":8}{int(statistics.median(pso)):>8}{pso[-1]:>8}')
     if 'guest' in rows[0]: line('resident: guest', [r['guest'][1] for r in rows])
     if any(r.get('available') for r in rows): line('available (iOS)', [r['available'] for r in rows])
     vg = max(r['guest'][0] for r in rows) if 'guest' in rows[0] else 0

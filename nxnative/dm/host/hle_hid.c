@@ -206,7 +206,8 @@ void hid_keys_init(void) {
 //   registered textures of that target (2 = 3D) with storage address and block-linear layout (nvn_mtl.m dm_gfx_texlist), "texraw <serial> <path>"
 //   saves a host texture's level 0 raw (nvn_mtl.m dm_gfx_texraw), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
-//   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "#…" is ignored.
+//   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "texmem <path>" writes every resident Metal allocation and
+//   memory pool to the file, one per line (nvn_mtl.m mtl_mem_textures: what the GPU's part of the footprint is made of), "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
@@ -220,6 +221,8 @@ static void *ctl_main(void *arg) {
                 if (!strcmp(line, "dump")) { crash_dump_now("DM_CTL dump"); continue; }
                 if (!strncmp(line, "burst ", 6)) { void dm_gfx_shot_burst(long n, const char *dir); char *e2; long n = strtol(line + 6, &e2, 10); while (*e2 == ' ') e2++; dm_gfx_shot_burst(n, e2); continue; }
                 if (!strncmp(line, "shot ", 5)) { dm_gfx_shot_at(1, line + 5); LOG("DM_CTL: screenshot of the next frame → %s", line + 5); continue; }
+                if (!strncmp(line, "texmem ", 7)) { void mtl_mem_textures(FILE *f); FILE *tf = fopen(line + 7, "w");
+                                                    if (tf) { mtl_mem_textures(tf); fclose(tf); LOG("DM_CTL: Metal allocations and memory pools → %s", line + 7); } else LOG("[RED] DM_CTL texmem: cannot write %s", line + 7); continue; }
                 if (!strncmp(line, "texlist ", 8)) { void dm_gfx_texlist(int target); dm_gfx_texlist(atoi(line + 8)); continue; }
                 if (!strncmp(line, "texraw ", 7)) { void dm_gfx_texraw(uint64_t serial, const char *path); char *e2; uint64_t s = strtoull(line + 7, &e2, 10); while (*e2 == ' ') e2++; dm_gfx_texraw(s, e2); continue; }
                 if (!strncmp(line, "probewin ", 9)) { void dm_probe_window(uint64_t n); dm_probe_window(strtoull(line + 9, NULL, 0)); continue; }

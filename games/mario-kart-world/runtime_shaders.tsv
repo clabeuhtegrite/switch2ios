@@ -83,6 +83,7 @@
 3ab4eff510cfd8a1	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xd34a8	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x1f4600	3584
 3acd8d95a8b235a8	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x148718	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x3ea500	3328
 3b45dca2b9307e8c	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0x993438	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0x86d600	1280
+3bd1f25684c6e609	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xf77b8	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x2ea800	6144
 3c031058d679216a	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x13e4c0	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x3dfe00	7680
 3c4418dd2645b188	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xe95c0	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x25b400	1536
 3e3f62f141037b47	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0xd5db0	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0xa4c000	1024
@@ -127,6 +128,8 @@
 5a61f84aaef9f359	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x1618c8	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x483700	4352
 5b282c61f61f2b6e	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x12f308	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x396100	6400
 5d42fde8a455b075	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0x5e288	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0x1e5500	1024
+5d57d8fa370ad2b5	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x117d98	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x364d00	1280
+6019594344e7105a	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xf67c0	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x2e4c00	5632
 60accb61cf99f663	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xd0d68	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x1eaf00	1280
 6249328c30439cf3	Lib/Terrain/tera_resource.Nin_Ounce_NVN2.release.sarc.zs	0x34e0	Lib/Terrain/tera_resource.Nin_Ounce_NVN2.release.sarc.zs	0x12a00	512
 625c3cd7510178a5	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xd34a8	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x1f7f00	3584
@@ -300,6 +303,7 @@ f10a43b601e2b367	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xd05e0	Shader/Driv
 f199607d8fe645c1	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0xae548	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0x2f4e00	768
 f20a9131db40d005	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x11d310	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x364100	1024
 f2b1ee17a8ff28d8	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xeb038	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x285e00	7168
+f32f8b25a0930542	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x14c2b8	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x3f9b00	9216
 f3fcb854f7ddc5f8	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0xe0098	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x230600	768
 f4743cbf6a0a4a13	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x148198	Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs	0x3e8a00	3072
 f48f3c5bd9b0a9ee	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0xd2340	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc	0x3bdf00	10496
