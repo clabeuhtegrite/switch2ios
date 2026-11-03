@@ -294,7 +294,10 @@ def run_game(a):
     with log.open('w') as f:
         p = subprocess.Popen(cmd, env=e, cwd=r, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
         for line in p.stdout: sys.stdout.write(line); f.write(line)
-    sys.exit(p.wait())
+    rc = p.wait()
+    ms = r / e.get('DM_MEMSTAT', '')   # the host's working directory is the run folder
+    if ms.is_file(): subprocess.run([py(), ROOT / 'tools/memstat.py', ms])   # the run's memory, summed up
+    sys.exit(rc)
 
 
 def main():

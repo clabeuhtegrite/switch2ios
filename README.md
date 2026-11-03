@@ -126,7 +126,7 @@ The runtime is [nxnative](https://github.com/seedds/nxnative): it loads the game
 |---|---|
 | `switch2mac.py` | setup, build, run, refresh, install, ios |
 | `games/<game>/` | one folder per game: `game.json` (title ID, name, version), the app's settings (`launcher.py`, `env.txt`; the iPhone app's `env_ios.txt`), the run-time shader list (`runtime_shaders.tsv`) and notes |
-| `tools/` | the shared pipeline list helper (`pipelines.py`), porting helpers: run-time shader finder, NSO disassembly helper, pass tracer, performance summary |
+| `tools/` | the shared pipeline list helper (`pipelines.py`), porting helpers: run-time shader finder, NSO disassembly helper, pass tracer, performance summary, memory summary (`memstat.py`) |
 | `nxnative/` | the runtime and tools: nxnative with switch2mac's Switch 2 changes (upstream's iOS app sources, which the shader tools share and `ios` builds) |
 | `nxnative/dm/games/<title ID>/` | the game profile: build IDs, memory layout, shader tables |
 | `docs/` | [porting.md](docs/porting.md) (bringing up a game), [mario-kart-world.md](docs/mario-kart-world.md) (how the first port was made), [ios.md](docs/ios.md) (the iPhone app) |

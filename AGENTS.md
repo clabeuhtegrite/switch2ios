@@ -31,6 +31,7 @@ switch2mac builds native Mac apps of Nintendo Switch 2 games from the user's own
 - **`ios`**: the iPhone app (unsigned IPA for LiveContainer, or `--xcode` for a project to sign). It compiles the shaders for iOS as well, so it is a slow step: ask first.
 - **App log:** `~/Library/Logs/nxnative/<title ID>.log`.
 - **Performance summary:** `tools/perf.sh [log]`.
+- **Memory summary:** `tools/memstat.py [memstat file] [--from S --to S]`: peak, median and a timeline of the footprint and its split (`run --phone` prints it when the game exits).
 - **Shared pipeline list:** `tools/pipelines.py new` / `merge` (docs/porting.md § 4b).
 
 ## Where things are

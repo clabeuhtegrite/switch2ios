@@ -4,6 +4,7 @@
 
 - `./switch2mac.py ios`: the iPhone app from the same build, through nxnative's iOS front end: Metal libraries compiled for iOS as well, an unsigned IPA for LiveContainer with the game files left out (`romfs.img` goes into the app's Documents), or `--xcode` for a project to sign. Not run on a phone yet (docs/ios.md).
 - `./switch2mac.py run --phone`: the iPhone app's switches and launcher defaults on the Mac, with memory statistics and address regions beside the log; `run --memstat` for the statistics alone.
+- `tools/memstat.py`: a memory statistics file summed up (peak, median and a timeline of the footprint, Metal and the guest / GPU / malloc split, time above a phone's budget); `run --phone` and `run --memstat` print it when the game exits.
 - Host: `DM_HEAP_REGION` and `DM_APP_POOL` size the guest heap region and the application pool at launch (beside `DM_ALIAS_SIZE`; sizes take K / M / G), the guest layout is logged at start, and `DM_VA_PROBE=1` logs the largest block of address space the process can reserve (also when the guest block does not fit).
 - iOS: `DM_MEMSTAT` and `DM_THRCPU` from the app's env files now start (they were read before the files were).
 - The Mac app is unchanged unless these switches are set.
