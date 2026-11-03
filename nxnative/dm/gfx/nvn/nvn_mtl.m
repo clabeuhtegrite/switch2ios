@@ -358,16 +358,27 @@ static uint64_t mem_charged(const void *p, uint64_t n) {
     }
     return r;
 }
+// The VM region at a: whether its pages can be read, and where it ends (a hole up to the next region cannot be read) → the end
+static uintptr_t vm_run(uintptr_t a, int *readable) {
+    vm_address_t r = (vm_address_t)a; vm_size_t rs = 0; vm_region_basic_info_data_64_t vi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+    if (vm_region_64(mach_task_self(), &r, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj) != KERN_SUCCESS) { *readable = 0; return UINTPTR_MAX; }   // nothing at or after a
+    if (r > a) { *readable = 0; return r; }
+    *readable = (vi.protection & VM_PROT_READ) != 0; return r + rs;
+}
 // Copies n bytes from p into d, zero where p's pages were never written (anonymous, neither in memory nor paged out: mincore), so the copy does not bring those pages into the
-// process (on Darwin a read of one gets a page of its own). → the bytes read
-static uint64_t mem_copy_written(uint8_t *d, const uint8_t *p, uint64_t n) {
-    uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n; uint64_t r = 0;
+// process (on Darwin a read of one gets a page of its own), and zero where they cannot be read (vm_run): a texture's storage can reach pages with nothing mapped, past the data
+// its levels use (Mario Kart World: a 1.4 MB texture's, from 28 KB before its end), which the CPU deswizzle never reads; copying it whole stopped the host with SIGBUS.
+// → the bytes read; *unread: the bytes that could not be
+static uint64_t mem_copy_written(uint8_t *d, const uint8_t *p, uint64_t n, uint64_t *unread) {
+    uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n, run = 0; uint64_t r = 0; int rd = 0; *unread = 0;   // run: the end of the VM region the copy is in, readable or not (rd)
     enum { CHUNK = 1024 }; char vec[CHUNK];
     for (uintptr_t a = s & ~(pg - 1); n && a < e; a += CHUNK * pg) {
         uintptr_t b = MIN(a + CHUNK * pg, (e + pg - 1) & ~(pg - 1)); int ok = !mincore((void *)a, b - a, vec);
         for (size_t j = 0; j < (b - a) / pg; j++) {
             uintptr_t lo = MAX(a + j * pg, s), hi = MIN(a + (j + 1) * pg, e);
-            if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && (vec[j] & MINCORE_ANONYMOUS)) memset(d + (lo - s), 0, hi - lo);
+            if (a + j * pg >= run) run = vm_run(a + j * pg, &rd);
+            if (!rd) { memset(d + (lo - s), 0, hi - lo); *unread += hi - lo; }
+            else if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && (vec[j] & MINCORE_ANONYMOUS)) memset(d + (lo - s), 0, hi - lo);
             else { memcpy(d + (lo - s), (const void *)lo, hi - lo); r += hi - lo; }
         }
     }
@@ -2887,15 +2898,19 @@ static void srt_touch(const tex_t *t, id o) {
     pthread_mutex_lock(&g_srt_mu); srt_sync(e, o); pthread_mutex_unlock(&g_srt_mu);
 }
 // DM_NVN_DESWZ_GPU=2 (mtl_init): a copy of a texture's storage for the GPU deswizzle. The open upload batch keeps it, and lets it go and takes it out of the residency set when the
-// batch completes; it counts as the batch's staging, so many uploads still split into batches as before. Never-written pages are copied as zeros, unread (mem_copy_written)
-static _Atomic uint64_t g_deswz_staged_n, g_deswz_staged_bytes, g_deswz_staged_read;
+// batch completes; it counts as the batch's staging, so many uploads still split into batches as before. Never-written pages and pages that cannot be read are copied as zeros,
+// unread (mem_copy_written)
+static _Atomic uint64_t g_deswz_staged_n, g_deswz_staged_bytes, g_deswz_staged_read, g_deswz_staged_unread;
 static id<MTLBuffer> deswz_stage(const tex_t *t) {
     NSUInteger n = (NSUInteger)((t->L.size + 0xFFFF) & ~0xFFFFull) + 0x10000;   // and 64 KB more of zeros: the pool's buffer had bytes past the storage's end, in case a deswizzle reads there
     id<MTLBuffer> b = [g_dev newBufferWithLength:n options:MTLResourceStorageModeShared];
     if (!b) MDIE("deswizzle copy of %llu bytes failed", (unsigned long long)t->L.size);
-    uint8_t *c = b.contents; uint64_t r = mem_copy_written(c, t->mem, t->L.size); memset(c + t->L.size, 0, n - t->L.size);
+    uint8_t *c = b.contents; uint64_t u, r = mem_copy_written(c, t->mem, t->L.size, &u); memset(c + t->L.size, 0, n - t->L.size);
     res_add(b); [g_up_keep addObject:b]; g_up_staging_bytes += n;
     atomic_fetch_add(&g_deswz_staged_n, 1); atomic_fetch_add(&g_deswz_staged_bytes, t->L.size); atomic_fetch_add(&g_deswz_staged_read, r);
+    if (u && !atomic_fetch_add(&g_deswz_staged_unread, u))
+        MLOG("[mem] deswizzle copy: texture ser=%llu %ux%u format %#x, storage %p+%#llx: %llu KB of it cannot be read, copied as zeros (the total is in texmem)", (unsigned long long)t->serial,
+             t->d.width, t->d.height, t->d.format, (void *)t->mem, (unsigned long long)t->L.size, (unsigned long long)(u >> 10));
     return b;
 }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, MTLTextureUsage keep) {
@@ -13006,8 +13021,8 @@ void mtl_mem_textures(FILE *f) { @autoreleasepool {
         }
         free(ph);
     }
-    fprintf(f, "deswizzle copies (DM_NVN_DESWZ_GPU=2)\t%llu\t%.1f MiB of storage\t%.1f MiB of it read\n", (unsigned long long)atomic_load(&g_deswz_staged_n),
-            atomic_load(&g_deswz_staged_bytes) / 1048576.0, atomic_load(&g_deswz_staged_read) / 1048576.0);
+    fprintf(f, "deswizzle copies (DM_NVN_DESWZ_GPU=2)\t%llu\t%.1f MiB of storage\t%.1f MiB of it read\t%.1f MiB that cannot be read, as zeros\n", (unsigned long long)atomic_load(&g_deswz_staged_n),
+            atomic_load(&g_deswz_staged_bytes) / 1048576.0, atomic_load(&g_deswz_staged_read) / 1048576.0, atomic_load(&g_deswz_staged_unread) / 1048576.0);
     free(pp); free(pb); free(pk);
 } }
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
