@@ -85,7 +85,7 @@ static void warm_claim(void);
 
 static id<MTLDevice> g_dev;
 static NSMutableArray *g_l3_gpu_leaks;
-static int g_nvn_deswz_gpu;
+static int g_nvn_deswz_gpu, g_nvn_deswz_staged;   // staged: DM_NVN_DESWZ_GPU=2 (pkg_upload_)
 static id<MTLCommandQueue> g_q;
 static id<MTL4CommandQueue> g_q4;
 static int g_classic_ok, g_classic;   // mtl_device_classic was asked / the device has no Metal 4 and only the classic part started (mtl_init)
@@ -358,6 +358,21 @@ static uint64_t mem_charged(const void *p, uint64_t n) {
     }
     return r;
 }
+// Copies n bytes from p into d, zero where p's pages were never written (anonymous, neither in memory nor paged out: mincore), so the copy does not bring those pages into the
+// process (on Darwin a read of one gets a page of its own). → the bytes read
+static uint64_t mem_copy_written(uint8_t *d, const uint8_t *p, uint64_t n) {
+    uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n; uint64_t r = 0;
+    enum { CHUNK = 1024 }; char vec[CHUNK];
+    for (uintptr_t a = s & ~(pg - 1); n && a < e; a += CHUNK * pg) {
+        uintptr_t b = MIN(a + CHUNK * pg, (e + pg - 1) & ~(pg - 1)); int ok = !mincore((void *)a, b - a, vec);
+        for (size_t j = 0; j < (b - a) / pg; j++) {
+            uintptr_t lo = MAX(a + j * pg, s), hi = MIN(a + (j + 1) * pg, e);
+            if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && (vec[j] & MINCORE_ANONYMOUS)) memset(d + (lo - s), 0, hi - lo);
+            else { memcpy(d + (lo - s), (const void *)lo, hi - lo); r += hi - lo; }
+        }
+    }
+    return r;
+}
 
 // ---------- Memory pools ----------
 typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; } pool_ent;   // res: already in the residency set (on demand, see pool_res)
@@ -490,11 +505,15 @@ void mtl_init(void) {
     g_keep = [NSMutableArray array];
     // DM_NVN_DESWZ_GPU=0: swizzled textures deswizzled on the CPU. The GPU deswizzle reads the texture's pool through the pool's zero-copy buffer, which puts the whole pool into
     // the residency set (pool_res), so a pool that holds only textures becomes resident too: on iOS wired whole, the parts the game never wrote included. For measuring that memory
+    // DM_NVN_DESWZ_GPU=2: the GPU deswizzles from a copy of the texture's storage in a buffer of its own, made for the upload and released with it, so the pool stays out of the
+    // residency set as with 0, at the GPU's speed (Mario Kart World with 0: 18 fps, the submit thread busy deswizzling)
     const char *dzg = getenv("DM_NVN_DESWZ_GPU"); int dz_off = dzg && atoi(dzg) == 0;
     g_nvn_deswz_gpu = !dz_off && nvn_deswz_gpu_init(g_dev) == 0;
+    g_nvn_deswz_staged = g_nvn_deswz_gpu && dzg && atoi(dzg) == 2;
     dm_res_report_register(mtl_res_counts);
     if (dz_off) MLOG("GPU deswizzle off (DM_NVN_DESWZ_GPU=0): swizzled textures are deswizzled on the CPU, their pools stay out of the residency set");
     else if (!g_nvn_deswz_gpu) MLOG("[RED] GPU deswizzle init failed; swizzled textures fall back to the CPU");
+    else if (g_nvn_deswz_staged) MLOG("GPU deswizzle from a copy (DM_NVN_DESWZ_GPU=2): each swizzled texture's storage is copied into a buffer for its upload, its pool stays out of the residency set");
     MLOG("Metal device %s", g_dev.name.UTF8String);
     udc_selftest();
 }
@@ -2179,20 +2198,25 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
 // In-place upgrade: when the original texture was not created with PixelFormatView (off by default, to keep Apple GPU lossless compression) but a different-format view is needed, create a new one with the original spec + PixelFormatView, copy over every slice × level, and replace the registration.
 // Count: across the 4 screens character select / camp / wilderness / combat, 17473 textures needed a different-format view 0 times, so this is a fallback and does not rely on predicting which textures need it
 // The same upgrade adds render-target usage for a whole-level clear (clear_tex) of a texture made without it: Monster Hunter Rise clears a 32x80 packaged one
+static char g_srt_key;   // a sparse render target's NvSparseRT, on its Metal texture (srt_make)
+static void srt_adopt(id e, id<MTLTexture> nt);
 static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> base, MTLTextureUsage add, MTLPixelFormat view_pf) {
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.textureType = base.textureType; d.pixelFormat = base.pixelFormat; d.width = base.width; d.height = base.height; d.depth = base.depth;   // Keep the original format, only add the format-view usage
     d.arrayLength = base.arrayLength; d.mipmapLevelCount = base.mipmapLevelCount; d.sampleCount = base.sampleCount;
     d.storageMode = base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
     d.resourceOptions = base.resourceOptions; d.usage = base.usage | add | (tex_atomic_capable(base) ? MTLTextureUsageShaderAtomic : 0);   // the usage property leaves the atomic usage out
+    id srt = objc_getAssociatedObject(base, &g_srt_key);   // a sparse render target stays one: the new texture maps the same tiles, nothing to copy (srt_adopt)
+    if (srt) d.placementSparsePageSize = MTLSparsePageSize64;
     // A linear texture aliases the guest pool. Adding usage must keep that backing: a new standalone texture copies the old pixels once, but later GPU writes never reach the CPU map.
     id<MTLBuffer> backing = base.buffer;
     id<MTLTexture> upgraded = backing ? [backing newTextureWithDescriptor:d offset:base.bufferOffset bytesPerRow:base.bufferBytesPerRow] : [g_dev newTextureWithDescriptor:d];
     if (!upgraded) { RED_ONCE(45, "texture upgrade failed ser=%llu format %lu → %lu usage %#lx", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, (unsigned long)d.usage); return base; }
     res_add(upgraded);
-    id<MTL4ComputeCommandEncoder> b = backing ? nil : blit();   // shared backing already contains the pixels; copying it onto itself would overlap
+    if (srt) srt_adopt(srt, upgraded);
+    id<MTL4ComputeCommandEncoder> b = backing || srt ? nil : blit();   // shared backing already contains the pixels; copying it onto itself would overlap
     NSUInteger slices = base.textureType == MTLTextureType3D ? 1 : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
-    for (NSUInteger l = 0; !backing && l < base.mipmapLevelCount; l++) {
+    for (NSUInteger l = 0; !backing && !srt && l < base.mipmapLevelCount; l++) {
         NSUInteger w = MAX(base.width >> l, 1u), h = MAX(base.height >> l, 1u), z = base.textureType == MTLTextureType3D ? MAX(base.depth >> l, 1u) : 1;
         if (base.textureType == MTLTextureType3D)
             enc_b_copy_texture(b, base, 0, l, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, z), upgraded, 0, l, MTLOriginMake(0, 0, 0));
@@ -2640,6 +2664,193 @@ static id<MTLTexture> sparse_layers_upload(const tex_t *t, MTLTextureDescriptor 
     static int nl; if (nl++ < 40) MLOG("sparse texture ser=%llu %ux%ux%u format %#x levels %lu (NVN tiled %d, Metal tail from %lu, tile %lux%lu): %.0f MB; %u tiles newly backed, %u tiles and %u tails uploaded, %.0f MB in all", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long)levels, nvn_tiled, (unsigned long)first, (unsigned long)ts.width, (unsigned long)ts.height, t->L.size / 1048576.0, new_tiles, up_tiles, up_tails, e->used / 1048576.0);
     return mt;
 }
+// ---------- Sparse render targets (DM_NVN_SPARSE_RT=1) ----------
+// Mario Kart World draws into 10 sparse textures (4 of 16384x16384 R8, 4 of 8192x8192 RG16, 2 of 8192x8192 R16, 5 or 6 levels, flags SPARSE | COMPRESSIBLE), each in a virtual pool of
+// its own (flags 0x2a1) where it maps physical pages. Made whole they took 3.1 GB of Metal memory beside storage that has no page (its memory measures, part B), and on the console only
+// the mapped pages have memory. With the switch such a texture is a placement sparse texture: each 64 KB tile of its tiled levels with a page mapped behind it gets the Metal tile of
+// the physical 64 KB tile there, one Metal tile per physical tile (srt_tile_of), so what was drawn follows the physical memory when the game maps it elsewhere, as on the hardware, and
+// an unmapped tile reads 0 and drops writes, as there. An NVN tile and a Metal tile of 64 KB have the same shape in texels (sparse_layers_upload). The levels NVN or Metal keep in a mip
+// tail are backed whole. The mappings follow the pool's page table when the texture is next resolved on the submit thread after a mapping request on its pool (srt_touch): a render
+// pass resolves its targets as it opens, before its first draw. Open: a Metal tile stays with its physical tile for good (it could go back when the physical pool goes)
+enum { SRT_CHUNK = 256, SRT_LEVELS = 16 };   // Metal tiles per heap (16 MB); levels kept
+@interface NvSparseRT : NSObject { @public
+    const void *pool; uint64_t ser, gen, base, ls, lofs[SRT_LEVELS]; MTLSize ts;
+    uint32_t w, h, fmt, layers, tiled, per_layer, mapped, tail_tiles, syncs, off[SRT_LEVELS], nx[SRT_LEVELS], ny[SRT_LEVELS];
+    int64_t *tail;          // per layer: its tail's first Metal tile + 1 (0: none)
+    const uint8_t **cur;    // per tile of the tiled levels, layer by layer: the physical tile mapped there, NULL for none
+} @end
+@implementation NvSparseRT - (void)dealloc { free(cur); free(tail); } @end
+int nvn_sparse_tiles_phys(const void *pool, uint64_t a, uint32_t n, const uint8_t **out);   // hle_nvn.c
+static pthread_mutex_t g_srt_mu = PTHREAD_MUTEX_INITIALIZER;   // the tables below and every NvSparseRT
+static _Atomic unsigned g_srt_n;   // sparse render targets made: srt_touch looks for one only once there is one
+static NSMutableArray<id<MTLHeap>> *g_srt_heaps; static uint32_t g_srt_next, g_srt_cap;   // the heaps; the next free tile of the last one, and its tiles
+static uint64_t g_srt_tiles, g_srt_maps, g_srt_unmaps;   // Metal tiles given out; tile mappings made, taken off
+static nvn_hmap g_srt_tile = {.klen = 8};   // physical 64 KB tile (its host address) → its Metal tile (heap << 16 | tile) + 1
+static int srt_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_NVN_SPARSE_RT"); on = e && atoi(e) == 1; if (on) MLOG("sparse render targets (DM_NVN_SPARSE_RT=1): a sparse texture made on the GPU has memory only where its pool has pages mapped"); }
+    return on;
+}
+// n consecutive Metal tiles of one heap, from a new heap when the last has no room: heap << 16 | first tile, or -1. Caller holds g_srt_mu
+static int64_t srt_take(uint32_t n) {
+    if (!g_srt_heaps.count || g_srt_next + n > g_srt_cap) {
+        uint32_t cap = MAX(n, (uint32_t)SRT_CHUNK);
+        if (cap > 0x10000 || g_srt_heaps.count >= 0x10000) return -1;
+        MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+        hd.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64; hd.size = (NSUInteger)cap * SPARSE_TILE;
+        id<MTLHeap> h = [g_dev newHeapWithDescriptor:hd];
+        if (!h) { RED_ONCE(922, "sparse render targets: no heap of %u tiles after %llu MB of tiles: tiles past it stay unbacked (read 0)", cap, (unsigned long long)(g_srt_tiles * SPARSE_TILE >> 20)); return -1; }
+        res_add(h); if (!g_srt_heaps) g_srt_heaps = [NSMutableArray new];
+        [g_srt_heaps addObject:h]; g_srt_next = 0; g_srt_cap = cap;
+    }
+    int64_t at = (int64_t)(g_srt_heaps.count - 1) << 16 | g_srt_next; g_srt_next += n; g_srt_tiles += n;
+    return at;
+}
+// The Metal tile of a physical 64 KB tile (or of a tile's own address, bit 63 set, when the pool has no page table), taken the first time. Caller holds g_srt_mu
+static int64_t srt_tile_of(uint64_t key) {
+    void *v = nvn_hm_get(&g_srt_tile, &key); if (v) return (int64_t)(uintptr_t)v - 1;
+    int64_t at = srt_take(1); if (at >= 0) nvn_hm_put(&g_srt_tile, &key, (void *)(uintptr_t)(at + 1));
+    return at;
+}
+typedef struct { uint32_t heap; MTL4UpdateSparseTextureMappingOperation op; } srt_op;
+static srt_op *g_srt_ops; static size_t g_srt_nops, g_srt_cops;   // under g_srt_mu
+static void srt_op_add(int64_t at, MTLSparseTextureMappingMode mode, MTLRegion r, NSUInteger level, NSUInteger slice) {
+    if (g_srt_nops == g_srt_cops && !(g_srt_ops = realloc(g_srt_ops, (g_srt_cops = g_srt_cops ? 2 * g_srt_cops : 1024) * sizeof *g_srt_ops))) MDIE("sparse render target mapping list allocation failed");
+    g_srt_ops[g_srt_nops++] = (srt_op){(uint32_t)(at >> 16), (MTL4UpdateSparseTextureMappingOperation){mode, r, level, slice, (NSUInteger)(at & 0xFFFF)}};
+}
+static int srt_op_cmp(const void *a, const void *b) {   // the unmaps first, then by heap
+    const srt_op *x = a, *y = b; int ux = x->op.mode != MTLSparseTextureMappingModeUnmap, uy = y->op.mode != MTLSparseTextureMappingModeUnmap;
+    return ux != uy ? ux - uy : (x->heap > y->heap) - (x->heap < y->heap);
+}
+// The listed mappings of one texture, a call per heap. A region is unmapped at most once and mapped at most once per flush, and its unmap goes first
+static void srt_ops_flush(id<MTLTexture> mt) {
+    static MTL4UpdateSparseTextureMappingOperation ops[SPARSE_OPS];
+    if (!g_srt_nops) return;
+    qsort(g_srt_ops, g_srt_nops, sizeof *g_srt_ops, srt_op_cmp);
+    for (size_t i = 0; i < g_srt_nops;) {
+        uint32_t h = g_srt_ops[i].heap; int un = g_srt_ops[i].op.mode == MTLSparseTextureMappingModeUnmap; NSUInteger k = 0;
+        for (; i < g_srt_nops && g_srt_ops[i].heap == h && (g_srt_ops[i].op.mode == MTLSparseTextureMappingModeUnmap) == un && k < SPARSE_OPS; i++) ops[k++] = g_srt_ops[i].op;
+        [g_q4 updateTextureMappings:mt heap:g_srt_heaps[h] operations:ops count:k];
+    }
+    g_srt_nops = 0;
+}
+// The levels of layer y in a mip tail (NVN's or Metal's), whole, on the tiles taken for them at creation. Caller holds g_srt_mu
+static void srt_map_tails(NvSparseRT *e, id<MTLTexture> mt, unsigned y) {
+    int64_t at = e->tail[y] - 1; if (at < 0) return;
+    NSUInteger first = mt.firstMipmapInTail, levels = mt.mipmapLevelCount;
+    for (NSUInteger l = e->tiled; l < MIN(first, levels); l++) {
+        NSUInteger nx = (MAX(e->w >> l, 1u) + e->ts.width - 1) / e->ts.width, ny = (MAX(e->h >> l, 1u) + e->ts.height - 1) / e->ts.height;
+        srt_op_add(at, MTLSparseTextureMappingModeMap, MTLRegionMake3D(0, 0, 0, nx, ny, 1), l, y); at += (int64_t)(nx * ny);
+    }
+    if (first < levels) { NSUInteger n = (mt.tailSizeInBytes + SPARSE_TILE - 1) / SPARSE_TILE; if (n) srt_op_add(at, MTLSparseTextureMappingModeMap, MTLRegionMake3D(0, 0, 0, n, 1, 1), first, y); }
+}
+// The texture's mappings brought to its pool's page table: a tile whose physical tile changed is mapped to that one's Metal tile, one with none behind it now is unmapped.
+// A pool with no page table (mapped whole at its first request) is backed whole, each tile by its own address. Caller holds g_srt_mu
+static void srt_sync(NvSparseRT *e, id<MTLTexture> mt) {
+    uint64_t gen = nvn_sparse_pool_gen(e->pool);   // first: a request after it brings another sync
+    int sparse = nvn_sparse_pool(e->pool); unsigned maps = 0, unmaps = 0, lost = 0;
+    static const uint8_t **ph; static uint32_t cap;
+    for (unsigned y = 0; y < e->layers; y++) for (unsigned l = 0; l < e->tiled; l++) {
+        uint32_t n = e->nx[l] * e->ny[l];
+        if (n > cap) { free(ph); if (!(ph = malloc((size_t)n * sizeof *ph))) MDIE("sparse render target tile list of %u failed", n); cap = n; }
+        uint64_t lo = e->base + (uint64_t)y * e->ls + e->lofs[l];
+        if (!sparse || !nvn_sparse_tiles_phys(e->pool, lo, n, ph))
+            for (uint32_t i = 0; i < n; i++) ph[i] = (const uint8_t *)(uintptr_t)((lo + (uint64_t)i * SPARSE_TILE) | 1ull << 63);
+        const uint8_t **cur = e->cur + (size_t)y * e->per_layer + e->off[l];
+        for (uint32_t i = 0; i < n; i++) {
+            if (ph[i] == cur[i]) continue;
+            MTLRegion r = MTLRegionMake3D(i % e->nx[l], i / e->nx[l], 0, 1, 1, 1);
+            if (cur[i]) { uint64_t k = (uint64_t)(uintptr_t)cur[i]; void *v = nvn_hm_get(&g_srt_tile, &k);
+                if (v) srt_op_add((int64_t)(uintptr_t)v - 1, MTLSparseTextureMappingModeUnmap, r, l, y);
+                cur[i] = NULL; e->mapped--; unmaps += !ph[i]; }
+            if (!ph[i]) continue;
+            int64_t at = srt_tile_of((uint64_t)(uintptr_t)ph[i]);
+            if (at < 0) { lost++; continue; }
+            srt_op_add(at, MTLSparseTextureMappingModeMap, r, l, y);
+            cur[i] = ph[i]; e->mapped++; maps++;
+        }
+    }
+    srt_ops_flush(mt);
+    e->gen = gen; e->syncs++; g_srt_maps += maps; g_srt_unmaps += unmaps;
+    static unsigned nl; if ((maps || unmaps || lost) && (nl++ < 24 || nl % 1000 == 0))
+        MLOG("[mem] sparse render target ser=%llu %ux%ux%u format %#x, sync %u: %u tiles mapped, %u taken off%s, %u without a Metal tile; %u of %u tiles backed (%llu MB); "
+             "all sparse render targets: %llu Metal tiles (%llu MB in %lu heaps)", (unsigned long long)e->ser, e->w, e->h, e->layers, e->fmt, e->syncs, maps, unmaps, sparse ? "" : " (its pool has no page table: backed whole)",
+             lost, e->mapped, e->per_layer * e->layers, (unsigned long long)e->mapped * SPARSE_TILE >> 20, (unsigned long long)g_srt_tiles, (unsigned long long)(g_srt_tiles * SPARSE_TILE >> 20), (unsigned long)g_srt_heaps.count);
+}
+// A sparse render target for t, or nil to make it as before
+static id<MTLTexture> srt_make(const tex_t *t, MTLTextureDescriptor *d) {
+    if (!srt_on() || !g_q4 || !t->mem || !t->pool || !(t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) || !nvn_sparse_pool(t->pool) || t->L.size < SPARSE_LAYERS_MIN) return nil;
+    if ((t->d.target != 1 && t->d.target != 4) || t->d.samples > 1 || fmt_depth(t->d.format) || fmt_compressed(t->d.format) || rb_packed_shift(t->d.format)) return nil;
+    unsigned layers = t->d.target == 4 ? t->d.depth : 1;
+    uint32_t tw, th, td; int nvn_tiled = nvn_tex_sparse_tiles(&t->d, &tw, &th, &td);
+    if (nvn_tiled <= 0 || !layers) return nil;
+    MTLSize ts = [g_dev sparseTileSizeWithTextureType:d.textureType pixelFormat:d.pixelFormat sampleCount:1 sparsePageSize:MTLSparsePageSize64];
+    if (ts.width != tw || ts.height != th) { RED_ONCE(923, "sparse render target format %#x: NVN's tile %ux%u, Metal's %lux%lu: made whole", t->d.format, tw, th, (unsigned long)ts.width, (unsigned long)ts.height); return nil; }
+    MTLTextureDescriptor *sd = [d copy];
+    sd.storageMode = MTLStorageModePrivate; sd.hazardTrackingMode = MTLHazardTrackingModeUntracked; sd.placementSparsePageSize = MTLSparsePageSize64;
+    sd.usage |= MTLTextureUsagePixelFormatView;   // a format view would remake it (tex_upgrade)
+    id<MTLTexture> mt = [g_dev newTextureWithDescriptor:sd];
+    if (!mt) { RED_ONCE(924, "no sparse render target for %ux%ux%u format %#x target %d: made whole", t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target); return nil; }
+    NvSparseRT *e = [NvSparseRT new];
+    NSUInteger first = mt.firstMipmapInTail, levels = mt.mipmapLevelCount;
+    e->pool = t->pool; e->ser = t->serial; e->base = (uint64_t)(uintptr_t)t->mem; e->ls = t->L.layer_size; e->ts = ts;
+    e->w = t->d.width; e->h = t->d.height; e->fmt = t->d.format; e->layers = layers;
+    e->tiled = (uint32_t)MIN(MIN((NSUInteger)nvn_tiled, first), MIN(levels, (NSUInteger)SRT_LEVELS));
+    uint32_t n = 0;
+    for (unsigned l = 0; l < e->tiled; l++) { e->off[l] = n; e->lofs[l] = nvn_tex_level_offset(&t->d, l); e->nx[l] = (MAX(e->w >> l, 1u) + tw - 1) / tw; e->ny[l] = (MAX(e->h >> l, 1u) + th - 1) / th; n += e->nx[l] * e->ny[l]; }
+    e->per_layer = n;
+    if (!(e->cur = calloc((size_t)n * layers + 1, sizeof *e->cur)) || !(e->tail = calloc(layers, sizeof *e->tail))) MDIE("sparse render target tables of %u tiles failed", n * layers);
+    for (NSUInteger l = e->tiled; l < MIN(first, levels); l++) e->tail_tiles += (uint32_t)(((MAX(e->w >> l, 1u) + ts.width - 1) / ts.width) * ((MAX(e->h >> l, 1u) + ts.height - 1) / ts.height));
+    if (first < levels) e->tail_tiles += (uint32_t)((mt.tailSizeInBytes + SPARSE_TILE - 1) / SPARSE_TILE);
+    res_add(mt);
+    objc_setAssociatedObject(mt, &g_srt_key, e, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    pthread_mutex_lock(&g_srt_mu);
+    for (unsigned y = 0; y < layers && e->tail_tiles; y++) { e->tail[y] = srt_take(e->tail_tiles) + 1; srt_map_tails(e, mt, y); }
+    srt_sync(e, mt);
+    pthread_mutex_unlock(&g_srt_mu);
+    atomic_fetch_add(&g_srt_n, 1);
+    static int nl; if (nl++ < 16) MLOG("[mem] sparse render target ser=%llu %ux%ux%u format %#x levels %lu (tiled %u, tile %lux%lu, %u tiles a layer, %u in tails): %llu MB whole, %u tiles backed now",
+                                     (unsigned long long)t->serial, e->w, e->h, layers, e->fmt, (unsigned long)levels, e->tiled, (unsigned long)ts.width, (unsigned long)ts.height, n, e->tail_tiles,
+                                     (unsigned long long)(t->L.size >> 20), e->mapped);
+    return mt;
+}
+// tex_upgrade remade a sparse render target with more usage: the new texture maps the same tiles, so it keeps what was drawn without a copy, and takes over the NvSparseRT
+static void srt_adopt(id eo, id<MTLTexture> nt) {
+    NvSparseRT *e = eo;
+    pthread_mutex_lock(&g_srt_mu);
+    objc_setAssociatedObject(nt, &g_srt_key, e, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    for (unsigned y = 0; y < e->layers; y++) {
+        srt_map_tails(e, nt, y);
+        for (unsigned l = 0; l < e->tiled; l++) {
+            const uint8_t **cur = e->cur + (size_t)y * e->per_layer + e->off[l];
+            for (uint32_t i = 0; i < e->nx[l] * e->ny[l]; i++) {
+                uint64_t k = (uint64_t)(uintptr_t)cur[i]; void *v = cur[i] ? nvn_hm_get(&g_srt_tile, &k) : NULL;
+                if (v) srt_op_add((int64_t)(uintptr_t)v - 1, MTLSparseTextureMappingModeMap, MTLRegionMake3D(i % e->nx[l], i / e->nx[l], 0, 1, 1, 1), l, y);
+            }
+        }
+    }
+    srt_ops_flush(nt);
+    pthread_mutex_unlock(&g_srt_mu);
+}
+// A texture resolved on the submit thread: a sparse render target's mappings brought up to date after a mapping request on its pool (see above)
+static void srt_touch(const tex_t *t, id o) {
+    if (!atomic_load_explicit(&g_srt_n, memory_order_relaxed) || !o || !t->pool || !(t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) || !on_sub_thread()) return;
+    NvSparseRT *e = objc_getAssociatedObject(o, &g_srt_key);
+    if (!e || nvn_sparse_pool_gen(e->pool) == e->gen) return;
+    pthread_mutex_lock(&g_srt_mu); srt_sync(e, o); pthread_mutex_unlock(&g_srt_mu);
+}
+// DM_NVN_DESWZ_GPU=2 (mtl_init): a copy of a texture's storage for the GPU deswizzle. The open upload batch keeps it, and lets it go and takes it out of the residency set when the
+// batch completes; it counts as the batch's staging, so many uploads still split into batches as before. Never-written pages are copied as zeros, unread (mem_copy_written)
+static _Atomic uint64_t g_deswz_staged_n, g_deswz_staged_bytes, g_deswz_staged_read;
+static id<MTLBuffer> deswz_stage(const tex_t *t) {
+    NSUInteger n = (NSUInteger)((t->L.size + 0xFFFF) & ~0xFFFFull) + 0x10000;   // and 64 KB more of zeros: the pool's buffer had bytes past the storage's end, in case a deswizzle reads there
+    id<MTLBuffer> b = [g_dev newBufferWithLength:n options:MTLResourceStorageModeShared];
+    if (!b) MDIE("deswizzle copy of %llu bytes failed", (unsigned long long)t->L.size);
+    uint8_t *c = b.contents; uint64_t r = mem_copy_written(c, t->mem, t->L.size); memset(c + t->L.size, 0, n - t->L.size);
+    res_add(b); [g_up_keep addObject:b]; g_up_staging_bytes += n;
+    atomic_fetch_add(&g_deswz_staged_n, 1); atomic_fetch_add(&g_deswz_staged_bytes, t->L.size); atomic_fetch_add(&g_deswz_staged_read, r);
+    return b;
+}
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, MTLTextureUsage keep) {
     MTLTextureDescriptor *d = tex_desc(t, 1);
     if (!d) return nil;
@@ -2667,12 +2878,15 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         total += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * layers;
     }
     g_bp_up_bytes += total;
-    void *mb; uint64_t mo;
-    int use_gpu = !rb_shift && !sparse && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);   // a sparse pool's texture is gathered through its page table on the CPU
+    void *mb = NULL; uint64_t mo = 0;
+    int staged = g_nvn_deswz_staged && t->mem && t->L.size;   // DM_NVN_DESWZ_GPU=2: the GPU reads a copy of the storage (deswz_stage), the pool is not addressed
+    int use_gpu = !rb_shift && !sparse && g_nvn_deswz_gpu && (staged || mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo));   // a sparse pool's texture is gathered through its page table on the CPU
     if (g_nvn_deswz_gpu && !use_gpu && !sparse && !rb_shift) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
     if (use_gpu) {
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
         up_begin();
+        unsigned seq = g_up_seq;
+        if (staged) mb = (__bridge void *)deswz_stage(t);
         if (direct && !(mo & 7)) {
             id<MTLTexture> view = [mt newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint textureType:MTLTextureType2DArray levels:NSMakeRange(0,mt.mipmapLevelCount) slices:NSMakeRange(0,mt.arrayLength)];
             if (view) {
@@ -2691,6 +2905,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         }
         size_t stg_off;
         id<MTLBuffer> stg = up_alloc(total ? total : 16, &stg_off);
+        if (staged && g_up_seq != seq) mb = (__bridge void *)deswz_stage(t);   // up_alloc began another batch: the copy must be one this batch keeps until it completes
         size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits;
         for (unsigned l = 0; enc_ok && l < d.mipmapLevelCount; l++) {
             uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
@@ -3140,7 +3355,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         tex_put(t->serial, pk);
         return pk->view ? pk->view : pk->tex;
     }
-    if (have) return have;
+    if (have) { srt_touch(t, have); return have; }
     if (t->d.target == 10) {   // Buffer texture (TARGET_BUFFER): create the texture-buffer view directly on the memory pool buffer (zero copy; the GPU reads the pool's current content at execution time, same as NVN semantics)
         uint32_t pf = 0; uint8_t swz[4]; int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
         void *mb; uint64_t mo;
@@ -3171,7 +3386,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     // made the stencil read zero and rejected every deferred-lighting pass. Actual image writes add Metal usage before opening their encoder (image_prepare).
     ak.d.flags &= ~NVN_TEXTURE_FLAGS_IMAGE;
     pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); pthread_mutex_unlock(&g_smu);
-    if (shared) { tex_put(t->serial, shared); return shared; }
+    if (shared) { tex_put(t->serial, shared); srt_touch(t, shared); return shared; }
     // An sRGB twin: a texture over the same storage with the same description except linear vs sRGB colour (Metal views those without MTLTextureUsagePixelFormatView). Mario Kart World
     // renders each Grand Prix intro movie picture into an RGBA8 texture and samples it through an RGBA8_SRGB one; as two Metal textures the screen kept the first picture (the intro froze).
     // The twin becomes a format view of the shared texture, so writes through either name are seen by both. DM_NVN_SRGB_TWIN=0 turns this off
@@ -3204,7 +3419,8 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     if (!mt) {
         MTLTextureDescriptor *d = tex_desc(t, 0);
         if (!d) return nil;
-        mt = image_texture(t, d); how = "in an image heap";
+        mt = srt_make(t, d); how = "a sparse render target, backed where its pool has pages mapped";
+        if (!mt) { mt = image_texture(t, d); how = "in an image heap"; }
         if (!mt) { mt = [g_dev newTextureWithDescriptor:d]; how = "a GPU texture, zero-filled up to 64 MB";
             if (mt) { res_add(mt); if (tex_init_fill(t, mt)) how = "a GPU texture, filled once from its storage"; else tex_zero_fill(mt); } }
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
@@ -12707,6 +12923,12 @@ void mtl_mem_textures(FILE *f) { @autoreleasepool {
     for (int k = 0; k < PR_SITES && g_pr_site[k].n; k++) fprintf(f, "%d\t%llu\t%.1f\n", g_pr_site[k].line, (unsigned long long)g_pr_site[k].n, g_pr_site[k].bytes / 1048576.0);
     pthread_mutex_unlock(&g_mu);
     fprintf(f, "\nstorage checks (mem_any)\t%.1f MiB read\t%.1f MiB skipped as never written\n", atomic_load(&g_mem_any_read) / 1048576.0, atomic_load(&g_mem_any_skip) / 1048576.0);
+    pthread_mutex_lock(&g_srt_mu);
+    fprintf(f, "sparse render targets (DM_NVN_SPARSE_RT)\t%u made\t%llu Metal tiles\t%.1f MiB in %lu heaps\t%llu tile mappings made\t%llu taken off\n", atomic_load(&g_srt_n),
+            (unsigned long long)g_srt_tiles, g_srt_tiles * (double)SPARSE_TILE / 1048576.0, (unsigned long)g_srt_heaps.count, (unsigned long long)g_srt_maps, (unsigned long long)g_srt_unmaps);
+    pthread_mutex_unlock(&g_srt_mu);
+    fprintf(f, "deswizzle copies (DM_NVN_DESWZ_GPU=2)\t%llu\t%.1f MiB of storage\t%.1f MiB of it read\n", (unsigned long long)atomic_load(&g_deswz_staged_n),
+            atomic_load(&g_deswz_staged_bytes) / 1048576.0, atomic_load(&g_deswz_staged_read) / 1048576.0);
     free(pp); free(pb); free(pk);
 } }
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)

@@ -2675,6 +2675,17 @@ uint64_t nvn_sparse_mapped_bytes(const void *pool, uint64_t a, uint64_t n) {   /
     pthread_mutex_unlock(&g_vp_mu); return got;
 }
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
+// The physical memory behind each of n 64 KB tiles from a (the host address of the page behind its first 4 KB; NULL where that is unmapped), for sparse render targets (nvn_mtl.m
+// srt_sync), which give each physical tile one Metal tile, wherever the game maps it. → 0 when the pool has no page table (not sparse, or aliased whole onto a physical pool since)
+int nvn_sparse_tiles_phys(const void *pool, uint64_t a, uint32_t n, const uint8_t **out) {
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a);
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t o = v ? a - (uint64_t)(uintptr_t)v->base + (uint64_t)i * 0x10000 : 0;
+        const vpte *e = v && o < v->size ? vpt_get(v, o) : NULL;
+        out[i] = e ? e->phys : NULL;
+    }
+    pthread_mutex_unlock(&g_vp_mu); return v != NULL;
+}
 NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
     rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, ib, ind});
 }
