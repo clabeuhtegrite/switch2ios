@@ -3,7 +3,7 @@
 //   in:  records of [u32 id][u32 header bytes][u32 code bytes][code]
 //   out: records of [u32 id][u32 lowered bytes, 0 = rejected][u32 reason bytes][u32 constant buffer of the texture handles, ~0 = none named][u32 map entries][u32 jump tables][u32 computed branches]
 //        [lowered][reason][map: u32 lowered instruction of each native one][jump tables: u32 c1 byte offset]
-//   A lowering's reason ends with the instruction it stopped at: " (opcode 0x... at +0x<byte offset in the code>: <its four words>)"
+//   A capture's or a lowering's reason ends with the instruction it stopped at: " (opcode 0x... at +0x<byte offset in the code>: <its four words>)"
 // The capture and lowering are what Eden's GenericEnvironment::InitializeNativeCode does on the program it reads from GPU memory
 #include <algorithm>
 #include <cstdio>
@@ -24,12 +24,18 @@ int main(int argc, char **argv) {
         std::vector<Instruction> code;
         ProgramCaptureState capture;
         std::string why;
+        // The instruction a capture or a lowering stopped at, to tell which one it lacks: its opcode, where it is, its four words
+        const auto where = [&](u32 at) {
+            char w[96] = "";
+            if (at < code.size()) snprintf(w, sizeof w, " (opcode 0x%03x at +0x%x: %08x %08x %08x %08x)", code[at].Bits(0, 12), at * u32{sizeof(Instruction)}, code[at].words[0], code[at].words[1], code[at].words[2], code[at].words[3]);
+            return std::string(w);
+        };
         for (u32 i = 0; h[1] + (u64{i} + 1) * sizeof(Instruction) <= h[2] && i < ProgramCaptureState::MaximumInstructions; i++) {
             Instruction ins;
             memcpy(&ins, d.data() + h[1] + i * sizeof(Instruction), sizeof ins);
             code.push_back(ins);
             auto r = capture.Observe(ins, i);
-            if (r == ProgramCaptureState::Result::InvalidTarget) { why = "branch outside the capture"; break; }
+            if (r == ProgramCaptureState::Result::InvalidTarget) { why = "branch outside the capture" + where(i); break; }
             if (r == ProgramCaptureState::Result::Complete) break;
         }
         std::vector<u64> lowered;
@@ -38,12 +44,7 @@ int main(int argc, char **argv) {
         if (why.empty()) {
             auto r = LowerToMaxwell(code);
             if (r) { lowered = std::move(r.instructions); texture_buffer = r.required_texture_buffer; map = std::move(r.source_instruction_offsets); }
-            else {   // the instruction the lowering stopped at, to tell which one it lacks: its opcode, where it is, its four words
-                const u32 at = r.error_offset / sizeof(Instruction);
-                char where[96] = "";
-                if (at < code.size()) snprintf(where, sizeof where, " (opcode 0x%03x at +0x%x: %08x %08x %08x %08x)", code[at].Bits(0, 12), r.error_offset, code[at].words[0], code[at].words[1], code[at].words[2], code[at].words[3]);
-                why = std::string(r.error) + where;
-            }
+            else why = std::string(r.error) + where(r.error_offset / sizeof(Instruction));
         }
         // A computed branch reads its target from c1: the LDC writing its register (Maxwell's encoding, c1, no address mode) says where that table starts
         for (size_t i = 0; i < lowered.size(); i++) {

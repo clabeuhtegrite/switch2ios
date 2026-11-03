@@ -1672,11 +1672,12 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             }
             break;
         }
-        case 0x307: { // FRND.F32, round to an integral floating-point value
+        case 0x307: case 0xb07: { // FRND.F32, round to an integral floating-point value, from a register or a constant buffer (abs 62, neg 63 in both)
             if (insn.Bits(75, 2) != 2 || insn.Bits(84, 2) != 2 || insn.Bits(81, 3) ||
                 insn.Bits(86, 6)) return fail(index, "native floating round format");
+            const u32 source = opcode == 0xb07 ? materialize(2, 0, 252, false, false) : insn.Bits(32, 8);
             emit(base(0x5ca8000000000000ULL) | (u64{2} << 8) | (u64{2} << 10) |
-                 (u64{insn.Bits(32, 8)} << 20) | (u64{8 + insn.Bits(78, 2)} << 39) |
+                 (u64{source} << 20) | (u64{8 + insn.Bits(78, 2)} << 39) |
                  (u64{insn.Bits(80, 1)} << 44) | (u64{insn.Bits(63, 1)} << 45) |
                  (u64{insn.Bits(62, 1)} << 49));
             break;
@@ -1707,15 +1708,16 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             result.instructions.push_back(translated);
             break;
         }
-        case 0x387: case 0x983: { // Captured scalar local spill at an immediate byte offset.
+        case 0x387: case 0x983: { // Captured local spill at an immediate byte offset: 32, 64 or 128 bits (73-75: 4, 5, 6, Maxwell's sizes too), from aligned registers
             const bool store = opcode == 0x387;
-            const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24);
-            if (insn.Bits(24, 8) != 255 || (store && (insn.Bits(16, 8) || data > 247)) ||
-                (!store && (data || dest >= 248)) || (offset & 3) || offset > 0x7fffff ||
-                insn.words[2] != (store ? 0x00100800U : 0x00300800U))
-                return fail(index, "native local scalar spill mode");
+            const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24), size = insn.Bits(73, 3);
+            const u32 count = size == 6 ? 4U : size == 5 ? 2U : 1U, reg = store ? data : static_cast<u32>(dest);
+            if (insn.Bits(24, 8) != 255 || size < 4 || size > 6 || (store && insn.Bits(16, 8)) || (!store && data) ||
+                reg + count > 248 || (reg % count) || (offset % (4 * count)) || offset > 0x7fffff ||
+                (insn.words[2] & ~(7U << 9)) != (store ? 0x00100000U : 0x00300000U))
+                return fail(index, "native local spill mode");
             emit((store ? 0xef50000000000000ULL : 0xef40000000000000ULL) | predicate |
-                 (store ? data : dest) | (u64{255} << 8) | (u64{offset} << 20) | (u64{4} << 48));
+                 reg | (u64{255} << 8) | (u64{offset} << 20) | (u64{size} << 48));
             break;
         }
         case 0x803: { // P2R PR, register merge source, immediate mask, byte select (76-77)
@@ -1917,11 +1919,14 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                  (u64{insn.Bits(76, 4)} << 48) | (u64{1} << 52) | (u64{insn.Bits(80, 1)} << 55));
             break;
         }
-        case 0x434: { // HSETP2 with an immediate half pair: A swizzle 74-75 (neg 72, abs 73),
-                      // combine 69-70, H_AND 71, compare 76-79, FTZ 80, P/Q 81-86, input 87-90.
-            mov_imm(250, insn.words[1]);
+        case 0x434: case 0x634: { // HSETP2 with an immediate or a constant-buffer half pair: A swizzle 74-75 (neg 72, abs 73),
+                      // combine 69-70, H_AND 71, compare 76-79, FTZ 80, P/Q 81-86, input 87-90; the constant-buffer B's swizzle 60-61 (abs 62, neg 63), as HADD2's.
+            HalfSource b{250, 0, false, false};
+            if (opcode == 0x434) mov_imm(250, insn.words[1]);
+            else b = half_source(2);
             emit(0x5d20000000000000ULL | predicate | insn.Bits(84, 3) | (u64{insn.Bits(81, 3)} << 3) |
-                 (u64{insn.Bits(80, 1)} << 6) | (u64{insn.Bits(24, 8)} << 8) | (u64{250} << 20) |
+                 (u64{insn.Bits(80, 1)} << 6) | (u64{insn.Bits(24, 8)} << 8) | (u64{b.reg} << 20) |
+                 (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) | (u64{b.negate} << 31) |
                  (u64{insn.Bits(76, 4)} << 35) | (u64{insn.Bits(87, 3)} << 39) |
                  (u64{insn.Bits(90, 1)} << 42) | (u64{insn.Bits(72, 1)} << 43) |
                  (u64{insn.Bits(73, 1)} << 44) | (u64{insn.Bits(69, 2)} << 45) |
