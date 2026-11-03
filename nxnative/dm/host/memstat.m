@@ -12,9 +12,9 @@
 #include <TargetConditionals.h>
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
+#include <stdatomic.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
-#include <stdatomic.h>
 #endif
 #include "dm.h"
 
