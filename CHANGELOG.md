@@ -7,7 +7,8 @@
 - `tools/memstat.py`: a memory statistics file summed up (peak, median and a timeline of the footprint, Metal and the guest / GPU / malloc split, time above a phone's budget); `run --phone` and `run --memstat` print it when the game exits.
 - Host: `DM_HEAP_REGION` and `DM_APP_POOL` size the guest heap region and the application pool at launch (beside `DM_ALIAS_SIZE`; sizes take K / M / G), the guest layout is logged at start, and `DM_VA_PROBE=1` logs the largest block of address space the process can reserve (also when the guest block does not fit).
 - iOS: `DM_MEMSTAT` and `DM_THRCPU` from the app's env files now start (they were read before the files were).
-- The Mac app is unchanged unless these switches are set.
+- Mario Kart World's sdk (SDK 19.3.3 for the Switch 2) gets nxnative's AddressRegionManager node area cut (1 GB → 62 MB at the start of the alias region), which no SDK-wide rule matched: its constructor opens with a pointer-authentication prologue. The game's address regions then start at alias +0.06 GB instead of +1 GB, the room a phone's smaller alias region needs. It applies to the Mac build too (a rebuild picks it up); nothing else changes there.
+- Apart from that cut, the Mac app is unchanged unless these switches are set.
 
 ## 2026-11-03 (2)
 

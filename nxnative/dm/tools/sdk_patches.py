@@ -59,6 +59,15 @@ CUTS = {
     (0x145bfc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x145c68, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # Mario Kart World 1.0.0 (v0) sdk (SDK 19.3.3 for the Switch 2: NintendoSdk_nnSdk-Generic_19_3_3-Release, spec Ounce): the same node area cut. No SDK-wide rule matches it: the
+  # constructor (sdk+0x14a9c0, 0x140 bytes, no symbol; VammManager::AllocateAddressRegion follows at sdk+0x14ab00) opens with a pointer-authentication prologue (pacibsp), which puts
+  # the limit at +0x18 (alias start + 0x3fe00000, stored at +0x28; then a unit heap of 0x30-byte nodes, and the area registered as occupied at +0xa4). Measured with
+  # switch2mac.py run --phone (2026-11-03): without the cut the game's first address region starts at alias +0.998 GB, and its 1,452 regions (1.29 GB) end at +2.93 GB of the
+  # 10 GB alias region, which a phone's layout must shrink. Its regions are all under 114 MB, so the 32 MB / 1 GB alignment classes cost little and are left alone
+  '90ebba182862b9ecdc21fcb87b999012': [
+    (0x14a9d8, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x14aa64, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+  ],
 }
 
 # SDK-wide function patches (dm/tools/nso_match.py): the two fixes above that hold for any game on an iPhone's small address space, for every game's sdk of a build with no CUTS
@@ -214,6 +223,9 @@ BINDING = [
     {'what': 'rows of builds not on the game drive (56ec2474, 9c73fb73, e01950c5)', 'now': 'build', 'goal': 'sdk', 'purpose': 'address space',
      'why': 'likely what the rules give (each names one of their implementations)',
      'blocked': 'no copy on the drive to compare'},
+    {'what': 'node area cut, SDK 19.3.3 for the Switch 2 (90ebba18, Mario Kart World 1.0.0)', 'now': 'build', 'goal': 'sdk', 'purpose': 'address space',
+     'why': 'its constructor opens with a pointer-authentication prologue, so no reviewed implementation matches (0x140 bytes, the limit at +0x18)',
+     'blocked': 'a rule for it needs the function fingerprint (nso_match.py on the sdk, where the dump is) and a second Switch 2 game to check it on'},
     {'what': 'VammManager node area and alignment, SDK 4.4.0 (9de92bad)', 'now': 'build', 'goal': 'sdk', 'purpose': 'address space',
      'why': 'an older implementation no rule covers (its large regions aligned to 32 MB, not the rules\' 2 MB); a rule once a second game ships it',
      'blocked': 'one game ships it'},
