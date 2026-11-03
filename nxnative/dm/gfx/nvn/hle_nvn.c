@@ -602,7 +602,7 @@ NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
 static void pk_drop(const void *p);
 NVN(nvnProgramFinalize, void, NVNprogram *p) { mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; pk_drop(p); }
 // a program's per-stage keys (side table: guest NVNprogram address → host object; bit i of ok = stage i computed)
-typedef struct { uint8_t key[6][8]; uint8_t ok; } prog_keys_t;
+typedef struct { uint8_t key[6][8]; uint8_t ok; uint32_t shared[6]; } prog_keys_t;   // shared: an NVN2 compute stage's shared memory bytes (ctl_shared)
 static pthread_mutex_t g_pk_mu = PTHREAD_MUTEX_INITIALIZER; static CFMutableDictionaryRef g_pk;   // a dedicated table (keys not shared with other side tables)
 static prog_keys_t *pk_get(const void *p, int make) {
     pthread_mutex_lock(&g_pk_mu);
@@ -649,6 +649,20 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     CC_SHA256_Final(md, &hc); memcpy(out, md, 8);
     return 1;
 }
+// The shared memory an NVN2 compute program's thread groups ask: control +0x64, when the stage byte at +0x56 says compute (5; nx2_split.py reads the same), 0 otherwise.
+// Read at SetShaders, while the section is valid (the game may free it once the call returns)
+static uint32_t ctl_shared(const NVNshaderData *sd) {
+    uint32_t v2[2], n = 0;
+    if (!sd->control) return 0;
+    memcpy(v2, (const uint8_t *)sd->control + 4, 8);
+    if (v2[0] == 0xc9 && (v2[1] == 0xb || v2[1] == 7) && ((const uint8_t *)sd->control)[0x56] == 5) memcpy(&n, (const uint8_t *)sd->control + 0x64, 4);
+    return n;
+}
+uint32_t prog_shared(const prog_t *p, unsigned st) {
+    if (st >= p->nstage) return 0;
+    prog_keys_t *k = pk_get(p, 0);
+    return k ? k->shared[st] : 0;
+}
 int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
     if (st >= p->nstage) return 0;
     prog_keys_t *k = pk_get(p, 1);
@@ -665,9 +679,10 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     static const char *trace; static int trace_init;
     if (!trace_init) { trace = getenv("DM_NVN_PROGTRACE"); trace_init = 1; }
     prog_keys_t *k = pk_get(p, 1);
-    k->ok = 0;
+    k->ok = 0; memset(k->shared, 0, sizeof k->shared);
     for (int i = 0; i < n; i++) {
         if (keys_hash(&sd[i], 1, k->key[i])) k->ok |= (uint8_t)(1u << i);
+        k->shared[i] = ctl_shared(&sd[i]);
         // Diagnostic: trace the loader of selected shader keys (comma-separated hex).
         if (trace && (k->ok & (1u << i))) {
             char key[17]; for (int j = 0; j < 8; j++) snprintf(key + j * 2, 3, "%02x", k->key[i][j]);

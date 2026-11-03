@@ -164,6 +164,7 @@ while at < len(d):
     body += c1
     # Shared memory: control +0x64 (bytes; 0 for most, 128 .. 48 KB seen). Only sizes above Ryujinx's default 4 KB are declared, at most Metal's 32 KB a thread group: Mario Kart World's traffic
     # bone builder 62d2f8445ab5978d asks 48 KB and keeps 144 bytes per car in it; at the default 4 KB every car after the 28th got zero bone matrices and its body vanished
+    # (it and five more skeleton shaders of Shader/Drive ask 48 KB, indexed by the global thread ID: past 32 KB from entry 683 on; the host's DM_NVN_CS_SHARED_SPILL=1 keeps such arrays in device memory)
     if st == 'cs': facts[key] = {'local': list(local), 'shared': min(cs_shared.get(key, 0), 0x8000) if cs_shared.get(key, 0) > 0x1000 else 0}
     # shared 4: their stage memory has memories of its own (MeshShaderInfo), and 0 would declare Ryujinx's default 4 KB, which a 256-vertex mesh cannot spare (Metal: 32 KB)
     if st in ('ts', 'ms'): facts[key] = {'local': mesh_meta[key][0], 'shared': 4, 'mesh': mesh_meta[key][1] + mesh_prim(key, mesh_meta[key][1][3:])}

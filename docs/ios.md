@@ -50,6 +50,7 @@ LiveContainer runs the app inside its own process, so the app has LiveContainer'
 | `DM_NVN_SPARSE_FREE=1` | a sparse texture's tiles the game unmaps (the terrain) give their memory back for its next tiles, and its heaps go with the texture |
 | `DM_NVN_SPARSE_SHARE=1` | the tiles of such a texture that the game maps over the same physical 64 KB tile share one Metal tile, uploaded once (Mario Kart World maps each page of its terrain into 4 tiles); a tile it unmaps gives its memory back, as with `DM_NVN_SPARSE_FREE` |
 | `DM_NVN_SPARSE_RT=1` | large sparse textures the game draws into get memory only for the 64 KB tiles it has mapped, as on the console (Mario Kart World: 10 such textures, 3.1 GB made whole) |
+| `DM_NVN_CS_SHARED_SPILL=1` | a compute shader asking more shared memory than Metal's 32 KB a thread group keeps it in device memory (Mario Kart World's skeleton shaders ask 48 KB); Mac only for now, the variant being compiled from the shader's MSL |
 | `DM_NVN_MEMANY_MINCORE=0` | storage checks read every page again, the never-written ones included (to measure what skipping them saves) |
 
 Sizes are bytes, or whole K / M / G (`DM_APP_POOL=4G`). The guest block is 256 MB + alias region + 256 MB of stacks + heap region; its size and parts are logged at start (`[mem] guest block`).

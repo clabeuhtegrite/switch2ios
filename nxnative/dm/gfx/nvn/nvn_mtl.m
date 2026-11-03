@@ -4507,6 +4507,7 @@ static void shmap_load(void) {
     NSString *ventry; id<MTLFunction> vfn; int vfn_state;
     id<MTLFunction> pfn; int pfn_state, has_pull;
     id<MTLFunction> afn[4]; int afn_state, has_alpha;
+    id<MTLComputePipelineState> spill_ps; uint32_t spill_bytes; uint8_t spill_state, spill_ind; uint64_t spill_groups, spill_n;   // a compute shader's shared memory in device memory (cs_spill_prepare): state 1 = built, 2 = failed
     id<MTLLibrary> llib; NSMutableDictionary<NSNumber *, id<MTLFunction>> *lfn; int lfn_state, has_logic; } @end   // llib: the logic operation library <key>_bl, lfn: its fn_u / fn_m specialized per set of targets (lo_fn; lfn_state as afn_state; has_logic: the reflection names one, dmsh_logic.py)   // afn: fn, fn_u, fn_m, fn_d of the alpha test library <key>_ba (at_fn; afn_state 0 untried, 1 loaded, 2 failed; has_alpha: the reflection names one, dmsh_alpha.py)   // pfn: the same entry of the pulling library <key>_bp (pull_fn; has_pull: the reflection names one, dmsh_pull.py)   // vertex: the entry point loaded (by the depth mode); vfn: the same entry of the shadow-input library <key>_bv (vin_fn; state 0 untried, 1 loaded, 2 failed)
 @implementation NvShader
 - (void)dealloc { free(rf.c1); free(geo_slot); }
@@ -4840,6 +4841,7 @@ static NvShader *builtin_get(const char *ctl) {
     }
     return nil;
 }
+static void cs_spill_prepare(NvShader *sh, uint32_t asked);
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // Last result: same object, same serial and unchanged serial table means it is used directly
@@ -4870,6 +4872,7 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
         int st = stage_of(stage);
         NvShader *sh = st >= 0 ? shader_get([k stringByAppendingString:@"_b"], st) : nil;
         if (sh) o->sh[st] = sh; else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
+        if (sh && st == 5) cs_spill_prepare(sh, prog_shared(p, i));   // more shared memory than Metal gives a thread group (DM_NVN_CS_SHARED_SPILL)
         if (!sh && st == 2) strlcpy(o->gs_miss, k.UTF8String, sizeof o->gs_miss);
     }
     prog_fold_gs(o);   // a slice-writing geometry shader: the vertex shader's layer entry points instead
@@ -10758,6 +10761,90 @@ static id<MTL4ComputeCommandEncoder> dispatch_enc(void) {
     args_dirty_all();
     return e;
 }
+// ---------- Compute shared memory past Metal's limit (DM_NVN_CS_SHARED_SPILL=1, off by default) ----------
+// Metal gives a thread group at most maxThreadgroupMemoryLength bytes of threadgroup memory: 32 KB on every Apple GPU, M5 and A19 included. The build caps a compute shader's shared
+// array there (nx2_split.py), so an index past it reads and writes outside the array. Mario Kart World's six skeleton shaders (Shader/Drive, 4e0e8de032095269 and five more) ask 48 KB:
+// one 48-byte matrix per entry, the entry taken from the global thread ID, so group k of a dispatch uses bytes 3 KB x k to 3 KB x (k + 1) and groups 11 to 15 of a 16-group dispatch
+// (entries 683 to 1023) fall outside 32 KB; four of them also read entries a uniform buffer names. With the switch on, a compute program whose control section asks more than the
+// limit (hle_nvn.c prog_shared) runs a variant compiled here from its MSL (<key>_b.metal beside its library): the shared array becomes a slice of a device buffer, one slice per thread
+// group, each of the size the program asks, and its barriers order device memory as well. The buffer comes from the frame arena at buffer index CS_SPILL_BUFFER of the compute
+// table: a CS_SPILL_HEAD-byte header whose word 0 is the number of slices, then the slices; a group takes slice (its linear index) mod that number. A direct dispatch gets one slice
+// per group up to CS_SPILL_SLICES, an indirect one CS_SPILL_SLICES (more groups than slices running at once would share one)
+enum { CS_SPILL_BUFFER = 30, CS_SPILL_SLICES = 256, CS_SPILL_HEAD = 64 };
+static int cs_spill_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_CS_SHARED_SPILL"); v = e && atoi(e) > 0;
+        if (v) MLOG("DM_NVN_CS_SHARED_SPILL=1: a compute shader asking more shared memory than Metal's %lu bytes a thread group keeps it in device memory (a variant compiled from its MSL)",
+                    (unsigned long)g_dev.maxThreadgroupMemoryLength); }
+    return v;
+}
+static NSString *re_first(NSString *src, NSString *pat, NSUInteger group) {   // group `group` of the first match of pat in src, nil when there is none
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
+    return m && [m rangeAtIndex:group].location != NSNotFound ? [src substringWithRange:[m rangeAtIndex:group]] : nil;
+}
+static NSUInteger re_count(NSString *src, NSString *pat) { return [[NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil] numberOfMatchesInString:src options:0 range:NSMakeRange(0, src.length)]; }
+// The MSL of the device-memory variant (see above), nil when the shader has a form this does not handle (logged): one threadgroup array, declared in the kernel as
+// SPIRV-Cross writes it (threadgroup spvUnsafeArray<T, n> name; or threadgroup T name[n];) and not passed to other functions
+static NSString *cs_spill_msl(NSString *src, uint32_t words, const char *key) {
+    NSString *decl = @"\\bthreadgroup (?:spvUnsafeArray<(\\w+), \\d+> (\\w+)|(\\w+) (\\w+)\\[\\d+\\]);";
+    NSUInteger nd = re_count(src, decl), nk = re_count(src, @"kernel void \\w+\\(");
+    if (nd != 1 || nk != 1) { MLOG("[RED] compute shader %s: %lu threadgroup arrays and %lu kernels in its MSL (one of each expected): it keeps the capped array", key, (unsigned long)nd, (unsigned long)nk); return nil; }
+    NSString *ty = re_first(src, decl, 1), *nm = re_first(src, decl, 2);
+    if (!ty) { ty = re_first(src, decl, 3); nm = re_first(src, decl, 4); }
+    NSString *nmq = [NSRegularExpression escapedPatternForString:nm];
+    if (re_count(src, [NSString stringWithFormat:@"\\bthreadgroup\\b[^;{}()]*\\(?\\s*[&*]\\s*%@\\b", nmq])) { MLOG("[RED] compute shader %s: its shared array %s is passed to another function: it keeps the capped array", key, nm.UTF8String); return nil; }
+    NSString *tgp = re_first(src, @"uint3 (\\w+) \\[\\[threadgroup_position_in_grid\\]\\]", 1), *ntg = re_first(src, @"uint3 (\\w+) \\[\\[threadgroups_per_grid\\]\\]", 1);
+    NSMutableString *add = [NSMutableString stringWithFormat:@"device uint* dm_shm [[buffer(%d)]], ", CS_SPILL_BUFFER];
+    if (!tgp) { [add appendString:@"uint3 dm_tgp [[threadgroup_position_in_grid]], "]; tgp = @"dm_tgp"; }
+    if (!ntg) { [add appendString:@"uint3 dm_ntg [[threadgroups_per_grid]], "]; ntg = @"dm_ntg"; }
+    NSMutableString *out = [src mutableCopy];
+    NSRange kr = [[NSRegularExpression regularExpressionWithPattern:@"kernel void \\w+\\(" options:0 error:nil] firstMatchInString:out options:0 range:NSMakeRange(0, out.length)].range;
+    if (NSMaxRange(kr) < out.length && [out characterAtIndex:NSMaxRange(kr)] == ')') { MLOG("[RED] compute shader %s: a kernel with no parameters: it keeps the capped array", key); return nil; }
+    [out insertString:add atIndex:NSMaxRange(kr)];
+    NSString *slice = [NSString stringWithFormat:@"device %@* %@ = (device %@*)(dm_shm + %du + (((%@.z * %@.y + %@.y) * %@.x + %@.x) %% dm_shm[0]) * %uu);",
+                       ty, nm, ty, CS_SPILL_HEAD / 4, tgp, ntg, tgp, ntg, tgp, words];
+    [[NSRegularExpression regularExpressionWithPattern:decl options:0 error:nil] replaceMatchesInString:out options:0 range:NSMakeRange(0, out.length)
+                                                                                         withTemplate:[NSRegularExpression escapedTemplateForString:slice]];
+    [out replaceOccurrencesOfString:@"threadgroup_barrier(mem_flags::mem_threadgroup)" withString:@"threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)" options:0 range:NSMakeRange(0, out.length)];
+    for (NSString *at in @[@"atomic_uint", @"atomic_int", @"atomic_float"])
+        [out replaceOccurrencesOfString:[NSString stringWithFormat:@"(threadgroup %@*)&%@[", at, nm] withString:[NSString stringWithFormat:@"(device %@*)&%@[", at, nm] options:0 range:NSMakeRange(0, out.length)];
+    if (re_count(out, [NSString stringWithFormat:@"\\bthreadgroup\\b[^;]*\\b%@\\b", nmq])) { MLOG("[RED] compute shader %s: a use of its shared array %s this does not rewrite: it keeps the capped array", key, nm.UTF8String); return nil; }
+    return out;
+}
+static void cs_spill_prepare(NvShader *sh, uint32_t asked) {
+    if (sh->spill_state || !asked || asked <= g_dev.maxThreadgroupMemoryLength || !cs_spill_on()) return;
+    sh->spill_state = 2;   // failed, unless it gets through
+    uint64_t t0 = bp_now();
+    NSString *path = [NSString stringWithFormat:@"%@/%s.metal", g_msl_dir, sh->key];
+    NSError *e = nil; NSString *src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&e];
+    if (!src) { MLOG("[RED] compute shader %s asks %u bytes of shared memory, but its MSL %s cannot be read: it keeps the capped array", sh->key, asked, path.UTF8String); return; }
+    NSString *msl = cs_spill_msl(src, (asked + 3) / 4, sh->key);
+    if (!msl) return;
+    MTLCompileOptions *co = [MTLCompileOptions new]; co.preserveInvariance = YES;   // as the build compiles (dmsh_build.py MAC_METAL)
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:msl options:co error:&e];
+    id<MTLFunction> fn = lib ? [lib newFunctionWithName:sh->ventry ?: @"main0"] : nil;
+    id<MTLComputePipelineState> ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+    if (!ps) { MLOG("[RED] compute shader %s: its variant with the shared array in device memory failed to build: %s", sh->key, e ? e.localizedDescription.UTF8String : "no entry point"); return; }
+    sh->spill_ps = ps; sh->spill_bytes = ((asked + 3) / 4) * 4; sh->spill_state = 1;
+    MLOG("compute shader %s asks %u bytes of shared memory a thread group (Metal: %lu): its variant with the array in device memory is built (%.1f ms)", sh->key, asked,
+         (unsigned long)g_dev.maxThreadgroupMemoryLength, (double)(bp_now() - t0) / 1e6);
+}
+// The device slices of a spill variant's dispatch (see above), bound at CS_SPILL_BUFFER; the first dispatch, the first indirect one and each new largest group count are logged
+static void cs_spill_bind(id ce, NvShader *cs, const p_dispatch *dp) {
+    uint64_t groups = dp->ind ? 0 : (uint64_t)(dp->x > 0 ? dp->x : 0) * (uint64_t)(dp->y > 0 ? dp->y : 0) * (uint64_t)(dp->z > 0 ? dp->z : 0);
+    uint32_t slices = groups && groups <= CS_SPILL_SLICES ? (uint32_t)groups : CS_SPILL_SLICES;
+    id<MTLBuffer> b; size_t off = arena_alloc(CS_SPILL_HEAD + (size_t)slices * cs->spill_bytes, &b);
+    *(uint32_t *)((uint8_t *)b.contents + off) = slices;
+    enc_c_args(ce, b.gpuAddress + off, CS_SPILL_BUFFER);
+    cs->spill_n++;
+    if (cs->spill_n == 1 || groups > cs->spill_groups || (dp->ind && !cs->spill_ind))
+        MLOG("compute shader %s, shared memory in device memory: %s dispatch %s%dx%dx%d, %u slices of %u bytes (dispatch %llu of this shader)", cs->key, dp->ind ? "indirect" : "direct",
+             dp->ind ? "(group counts on the GPU) " : "", dp->x, dp->y, dp->z, slices, cs->spill_bytes, (unsigned long long)cs->spill_n);
+    if (groups > cs->spill_groups) cs->spill_groups = groups;
+    if (dp->ind) cs->spill_ind = 1;
+    static int over; if (groups > CS_SPILL_SLICES && !over++) MLOG("[RED] compute shader %s: %llu thread groups, more than %d slices: groups share slices (modulo)", cs->key, (unsigned long long)groups, CS_SPILL_SLICES);
+}
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
     g_wr_epoch++; g_mdx_epoch++;
@@ -10769,7 +10856,8 @@ static void dispatch(const p_dispatch *dp) {
     NvShader *cs = prog_get(S.cprog)->sh[5];
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
     const void *k = (__bridge const void *)cs;
-    id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
+    int spill = cs->spill_state == 1;   // its shared memory in device memory (cs_spill_prepare)
+    id<MTLComputePipelineState> ps = spill ? cs->spill_ps : hm_get_id(&g_cps, &k);
     if (!ps) {
         NSError *e = nil; uint64_t bt = bp_now(); ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&e];
         g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
@@ -10807,6 +10895,7 @@ static void dispatch(const p_dispatch *dp) {
     g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
     g_c0_dim_buf = nil;
     encode_args(ce, cs, 5, 0);
+    if (spill) cs_spill_bind(ce, cs, dp);
     if (dp->ind) {   // The shader reads the group counts from c0 + 0x200: copy the GPU-written ones there first (Metal 4 orders nothing inside an encoder without a barrier)
         if (g_c0_dim_buf) { [(id<MTL4ComputeCommandEncoder>)ce copyFromBuffer:(__bridge id<MTLBuffer>)ib sourceOffset:io toBuffer:g_c0_dim_buf destinationOffset:g_c0_dim_off size:12];
 #ifdef C0_NX2_DISPATCH
