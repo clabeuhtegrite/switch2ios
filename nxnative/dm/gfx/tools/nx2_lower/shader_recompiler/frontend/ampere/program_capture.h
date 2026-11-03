@@ -13,7 +13,8 @@ public:
     Result Observe(const Instruction& instruction, u32 index) {
         const u32 opcode = instruction.Bits(0, 12);
         if (opcode == 0x944 || opcode == 0x947 || opcode == 0x945) {
-            const u64 raw = instruction.words[1] | (u64{instruction.words[2] & 0x3ffff} << 32);
+            // BRA: bits 32-33 are not part of its offset (lower_to_maxwell.h: a uniform-branch hint)
+            const u64 raw = (instruction.words[1] & (opcode == 0x947 ? ~3U : ~0U)) | (u64{instruction.words[2] & 0x3ffff} << 32);
             const s64 relative = opcode == 0x945 ? static_cast<s32>(instruction.words[1])
                                                 : static_cast<s64>(raw << 14) >> 14;
             const s64 target = s64{index} * 16 + 16 + relative;

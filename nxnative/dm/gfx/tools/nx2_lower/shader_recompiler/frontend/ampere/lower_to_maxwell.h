@@ -1708,16 +1708,17 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             result.instructions.push_back(translated);
             break;
         }
-        case 0x387: case 0x983: { // Captured local spill at an immediate byte offset: 32, 64 or 128 bits (73-75: 4, 5, 6, Maxwell's sizes too), from aligned registers
+        case 0x387: case 0x983: { // Local store / load at [register + immediate byte offset] (RZ for a spill): 32, 64 or 128 bits (73-75: 4, 5, 6, Maxwell's sizes too),
+                                  // from aligned registers. 84-86 is a cache eviction hint (normal 1, last use 3: LDL.LU), which Maxwell's form leaves out
             const bool store = opcode == 0x387;
             const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24), size = insn.Bits(73, 3);
             const u32 count = size == 6 ? 4U : size == 5 ? 2U : 1U, reg = store ? data : static_cast<u32>(dest);
-            if (insn.Bits(24, 8) != 255 || size < 4 || size > 6 || (store && insn.Bits(16, 8)) || (!store && data) ||
-                reg + count > 248 || (reg % count) || (offset % (4 * count)) || offset > 0x7fffff ||
-                (insn.words[2] & ~(7U << 9)) != (store ? 0x00100000U : 0x00300000U))
+            if (size < 4 || size > 6 || (store && insn.Bits(16, 8)) || (!store && data) ||
+                reg + count > (uses_uniform_bank ? 216U : 246U) || (reg % count) || (offset % (4 * count)) || offset > 0x7fffff ||
+                (insn.words[2] & ~((7U << 9) | (7U << 20))))
                 return fail(index, "native local spill mode");
             emit((store ? 0xef50000000000000ULL : 0xef40000000000000ULL) | predicate |
-                 reg | (u64{255} << 8) | (u64{offset} << 20) | (u64{size} << 48));
+                 reg | (u64{insn.Bits(24, 8)} << 8) | (u64{offset} << 20) | (u64{size} << 48));
             break;
         }
         case 0x803: { // P2R PR, register merge source, immediate mask, byte select (76-77)
@@ -2250,7 +2251,10 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             } else if (insn.Bits(87, 4) != 7) {
                 return fail(index, "native extra branch condition");
             }
-            const u64 raw = insn.words[1] | (u64{insn.words[2] & 0x3ffff} << 32);
+            // The offset counts from bit 34 in words of 4 bytes (bits 32-33 are 0 in NAK's encoding). 1 there is taken for a uniform-branch hint (BRA.U: the
+            // branch is the same without it; Mario Kart World's effect shader dcb8b6a63363f982), 2 and 3 are not known
+            if (insn.Bits(32, 2) > 1) return fail(index, "native branch mode");
+            const u64 raw = (insn.words[1] & ~3U) | (u64{insn.words[2] & 0x3ffff} << 32);
             const s64 relative = static_cast<s64>(raw << 14) >> 14;
             const s64 target = s64{index} * 16 + 16 + relative;
             if (target < 0 || target % 16) return fail(index, "native branch destination alignment");
