@@ -4,7 +4,7 @@
 # written as an NVN1-shaped record: the keys stay those of the game's originals (the host's keys_hash), so nothing after this stage needs to know.
 # Usage: nx2_split.py <RomFS dir> <main image or -> <package dir> <map out> <facts out> <pairs out> <rejects out>    Environment: NX2_LOWER = the nx2_lower executable
 # Open: compute programs (header size 0, thread group not read from the 0xd8 section yet), BAHS (agl), and programs nx2_lower rejects: their keys are listed in the rejects table and not in the map
-import collections, hashlib, json, os, struct, subprocess, sys, tempfile
+import collections, hashlib, json, os, re, struct, subprocess, sys, tempfile
 import zstandard
 
 rom, main_img, pkg, mapout, factsout, pairsout, rejout = sys.argv[1:8]
@@ -142,7 +142,7 @@ while at < len(d):
     tables = struct.unpack_from(f'<{ntab}I', d, at); at += ntab * 4
     key = order[n]; label, st, code, c1o, local = progs[key]
     if nlow: texbuf['none' if tb == 0xffffffff else tb] += 1
-    if not nlow: rej.append((key, st, reason, label)); why[reason] += 1; continue
+    if not nlow: rej.append((key, st, reason, label)); why[re.sub(r' at \+0x[^)]*\)$', ')', reason)] += 1; continue   # counted by reason and opcode, without where
     # The lowering gives instructions only: Maxwell has a scheduling word at every 32-byte boundary, and its branches assume the pattern of a first instruction at +0x50 counted from the SPH (Eden's
     # InitializeNativeCode lays it out so): two instructions, a scheduling word, three, a scheduling word. Ryujinx's decoder counts from the first word after the SPH, where it skips a scheduling word, so a
     # scheduling word and a NOP move the first instruction to +0x10 there, the same place in the pattern. Laid out as Eden's, every shader "translated" with real instructions read as scheduling words

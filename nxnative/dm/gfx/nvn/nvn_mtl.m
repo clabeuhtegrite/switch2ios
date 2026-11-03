@@ -2846,7 +2846,9 @@ static id<MTLTexture> srt_make(const tex_t *t, MTLTextureDescriptor *d) {
     for (unsigned y = 0; y < layers && e->tail_tiles; y++) { e->tail[y] = srt_take(e->tail_tiles) + 1; srt_map_tails(e, mt, y); }
     srt_sync(e, mt);
     pthread_mutex_unlock(&g_srt_mu);
-    atomic_fetch_add(&g_srt_n, 1);
+    // Sparse render targets over the same physical pages share their Metal tiles (g_srt_tile), so what one draws another reads through another resource: from the first one on, barriers
+    // make aliased writes visible and no pass skips its barrier, as with image heaps (resource_vis, enc_r_begin_pass). For good: their tiles outlive any one of them
+    if (!atomic_fetch_add(&g_srt_n, 1)) atomic_fetch_add(&g_image_heap_n, 1);
     static int nl; if (nl++ < 16) MLOG("[mem] sparse render target ser=%llu %ux%ux%u format %#x levels %lu (tiled %u, tile %lux%lu, %u tiles a layer, %u in tails): %llu MB whole, %u tiles backed now",
                                      (unsigned long long)t->serial, e->w, e->h, layers, e->fmt, (unsigned long)levels, e->tiled, (unsigned long)ts.width, (unsigned long)ts.height, n, e->tail_tiles,
                                      (unsigned long long)(t->L.size >> 20), e->mapped);

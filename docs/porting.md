@@ -110,7 +110,7 @@ Each of these lessons cost days to find, and each will probably apply to the nex
 - **Movies**: 1.0.0 decodes VP9 through the low-level `nn::codec` API, not `movie::VideoDecoder`. `hle_nx2_codec.c` covers both with libvpx, on a worker thread per decoder.
 - **NVN2 compute driver constants**: c0 has its own layout on Switch 2 (dispatch size at +4 / +8). The NVN1 layout gave 1/0 → NaN → a white world.
 - **Translator**: the block after a `CAL` lost its fall-through edge in Ryujinx's decoder, which broke every shader with NVIDIA's slow-path sqrt / rsqrt / division subroutine.
-- **Opcodes the lowering lacked**: SM86 `0x59f` (SURED), `0x2bf` (UPOPC), and `0x923` / `0x927` (stage memory of task / mesh shaders). Check `work/shader/rejects.tsv` after every split.
+- **Opcodes the lowering lacked**: SM86 `0x59f` (SURED), `0x2bf` (UPOPC), and `0x923` / `0x927` (stage memory of task / mesh shaders). Check `work/shader/rejects.tsv` after every split: each reason ends with the instruction the lowering stopped at (its opcode, its byte offset in the program's code and its four words).
 - **Mesh and task shaders** (control section byte 0x56: 6 task, 7 mesh) now run as Metal object / mesh shaders, including per-primitive outputs and `DrawMeshTasks`. Layout notes are in the code (`MeshShaderInfo.cs`, `nx2_split.py`).
 - **Compute shared memory size**: control section +0x64. The split used to declare 4 KB for every shader, so a 48 KB shader silently lost data (vanishing traffic cars).
 - **Textures the CPU fills before creating them**: `tex_flush_upload` / `tex_dirty_upload`, plus "filled before init" detection. Without these, terrain height tiles were all zero.
