@@ -7,7 +7,8 @@
   ./switch2mac.py install                     move the finished app to /Applications (replacing the old one)
   ./switch2mac.py run [VAR=value ...]         run the build straight from ./work with a log in work/logs (for porting and debugging: docs/porting.md)
   ./switch2mac.py run --phone [VAR=value ...] the same with the iPhone app's switches and memory statistics: try the phone's settings on the Mac first (docs/ios.md)
-  ./switch2mac.py ios [--xcode]               the iPhone app (an unsigned IPA for LiveContainer, or an Xcode project to sign and run): after build (docs/ios.md)
+  ./switch2mac.py ios [--xcode] [--romfs]     the iPhone app (an unsigned IPA for LiveContainer, or an Xcode project to sign and run): after build (docs/ios.md);
+                                              --romfs packs the game files into it (<name>-full.ipa), else they are copied into the app's Documents
 
 The dump folder holds exefs/ (main, main.npdm, sdk, ...) and romfs/, or base/exefs and base/romfs.
 Everything the build writes goes to ./work (--work names another folder). Nothing of the game is in this repository.
@@ -228,7 +229,8 @@ def refresh(a):
 def ios(a):
     """The iPhone app from the finished build: the same rewritten modules and RomFS image, the shaders again with Metal libraries for iOS as well, then nxnative's build_ipa.sh:
     an unsigned IPA (work/<name>.ipa) for LiveContainer, or with --xcode a project to sign with your own team and run from Xcode (logs and a debugger on the phone). The game files
-    stay out of the app: copy work/extract/RomFS.img into the app's Documents folder as romfs.img (docs/ios.md). Nothing here leaves this Mac."""
+    stay out of the app: copy work/extract/RomFS.img into the app's Documents folder as romfs.img (docs/ios.md). With --romfs they go into the app instead (work/<name>-full.ipa,
+    the size of the RomFS image more: one file to install, but every new build means installing all of it again). Nothing here leaves this Mac."""
     e = env(); w, ex, b, sh, cache = paths(a)
     tf = w / 'title.txt'
     if not tf.exists(): sys.exit('no finished build: run build first')
@@ -239,13 +241,16 @@ def ios(a):
     say('launcher settings for the phone')
     run([py(), g['dir'] / 'launcher.py', NX, b / 'patched', b / 'launcher_ios.json', 'ios'], env=dict(e, DM_SHOW_FPS='YES'))
     ipa = w / subprocess.run([py(), NX / 'dm/games/game.py', tid, 'ipa'], capture_output=True, text=True, check=True, env=e).stdout.strip()
-    ie = dict(e, GAME=tid, W=str(w), PATCHED=str(b / 'patched'), ROMFS=str(ex / 'RomFS.img'), MSL_IOS=str(ios_lib), AOC='', DM_COPY_ROMFS='NO',
+    if a.romfs: ipa = ipa.with_name(f'{ipa.stem}-full{ipa.suffix}')   # beside the slim one, which stays the one to rebuild while the image sits in Documents
+    ie = dict(e, GAME=tid, W=str(w), PATCHED=str(b / 'patched'), ROMFS=str(ex / 'RomFS.img'), MSL_IOS=str(ios_lib), AOC='',
               DM_DISPLAY_NAME=g['name'], DM_APP_VERSION=g['version'], DM_SHOW_FPS='1', DM_LAUNCHER_JSON=str(b / 'launcher_ios.json'))
+    if not a.romfs: ie['DM_COPY_ROMFS'] = 'NO'   # the app then carries the image's identity only (romfs.id) and takes Documents/romfs.img; with --romfs, build_ipa.sh packs <app>/romfs.img
     envf = g['dir'] / 'env_ios.txt'
     if envf.exists(): ie['DM_ENV_FILE'] = str(envf)   # the phone's switches, as dm/env.txt in the app; Documents/env.txt on the phone overrides each of them
     say('iPhone app: Xcode project' if a.xcode else 'iPhone app: xcodebuild, then the IPA (several minutes)')
     run(['bash', NX / 'dm/ios/tools/build_ipa.sh', '--prepare-xcode' if a.xcode else ipa], env=ie)
     if a.xcode: print(f'\ndone: {w / "xcode"}/DmIOS.xcodeproj (Signing & Capabilities: your team; then Run on the phone, Release)')
+    elif a.romfs: print(f'\ndone: {ipa}, the game files inside\nnext: install it with LiveContainer, with room for it twice on the phone while it installs (docs/ios.md)')
     else: print(f'\ndone: {ipa}\nnext: install it with LiveContainer, then copy {ex / "RomFS.img"} into the app\'s Documents folder as romfs.img (docs/ios.md)')
 
 
@@ -311,6 +316,7 @@ def main():
     gp.add_argument('--phone', action='store_true', help="the iPhone app's switches (games/<game>/env_ios.txt) and memory statistics: the phone's settings tried on the Mac")
     gp.add_argument('--memstat', action='store_true', help='memory statistics (work/logs/memstat-*.tsv) and address regions (work/logs/regions-*.tsv) beside the log')
     ip = sub.add_parser('ios'); ip.add_argument('--xcode', action='store_true', help='an Xcode project to sign with your team and run on the phone, instead of the IPA')
+    ip.add_argument('--romfs', action='store_true', help="the game files packed into the app (<name>-full.ipa), instead of copied into its Documents folder")
     a = ap.parse_args()
     if a.cmd != 'setup' and Path(sys.prefix).resolve() != VENV.resolve():   # run inside .venv
         os.execv(py(), [str(py()), __file__] + sys.argv[1:])

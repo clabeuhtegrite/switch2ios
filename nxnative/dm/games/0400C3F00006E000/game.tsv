@@ -19,7 +19,8 @@ shader_versions	v0
 # every module main imports from
 modules	main subsdk0 sdk
 romfs_marker	Movie/StaffRoll_00.webm
-zip_store	.bwav:.sarc:.tscb:.webm:.xtx:.zs:.metallib
+# .img: the RomFS image, when switch2mac.py ios --romfs packs it into the IPA (23 GB of mostly zstd files, which deflate would not shrink)
+zip_store	.bwav:.sarc:.tscb:.webm:.xtx:.zs:.metallib:.img
 
 # ---- Memory ----
 # the NPDM declares 64 MB of system resource (virtual address memory) and main sets a heap: a 5 GB block with a large alias region; the heap check sizes the heap region from the heap the game asks for

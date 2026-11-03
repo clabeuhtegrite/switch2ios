@@ -22,13 +22,15 @@ The game is made for the 9.5 GB a Switch 2 gives it, and the host tells it the s
 2. `./switch2mac.py build <dump folder>`, as for the Mac.
 3. `./switch2mac.py ios`: the shaders again with Metal libraries for iOS as well (the first time about as long as the Mac's), then nxnative's `build_ipa.sh` packs `work/MarioKartWorld.ipa`, unsigned. `./switch2mac.py ios --xcode` makes an Xcode project instead (`work/xcode`), to sign with your own team and run on the phone with Xcode's log and debugger.
 
-The game files stay out of the IPA (`DM_COPY_ROMFS=NO`): the app carries only the identity of `work/extract/RomFS.img` and uses that image from its Documents folder.
+The game files stay out of the IPA (`DM_COPY_ROMFS=NO`): the app carries only the identity of `work/extract/RomFS.img` and uses that image from its Documents folder. `./switch2mac.py ios --romfs` packs them into the app instead, as `work/MarioKartWorld-full.ipa` (the slim one stays beside it): one file to install, about 23.7 GB, stored without compression.
 
 ## Installing with LiveContainer
 
 1. Install `work/MarioKartWorld.ipa` in LiveContainer.
 2. Copy `work/extract/RomFS.img` into the app's Documents folder: in the Files app, On My iPhone › LiveContainer › Data › Application › (the app's data folder) › Documents. Any letter case of `romfs.img` works; a copy cut off partway is ignored.
 3. Start the app from LiveContainer. Its log is `Documents/log.txt`, its memory statistics `Documents/memstat.tsv`.
+
+With `work/MarioKartWorld-full.ipa` (`ios --romfs`), step 1 alone does it, but the phone needs room for the game twice while LiveContainer installs it (the IPA and the app it unpacks, about 47 GB, more if the IPA is first saved in Files), and every new build means sending and installing all of it again. While the app keeps changing, the slim IPA with the image copied once into Documents is the quicker way: a new build is then 434 MB, and the image stays. A `Documents/romfs.img` is used before the one inside the app.
 
 LiveContainer runs the app inside its own process, so the app has LiveContainer's entitlements, not its own. The log's first `[mem] address space` line (`DM_VA_PROBE`) says how large a block it can reserve: about 6 GB means no extended virtual addressing.
 
