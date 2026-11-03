@@ -1,7 +1,7 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN=1 starts it that way. ⌘Q quits; the left mouse button is the touchscreen.
-// Key map (Nintendo layout): 1 = performance overlay mode, 2 = settings panel, WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
+// Key map (Nintendo layout): 1 = performance overlay mode, 2 = settings panel, 3 = screenshot of the picture as shown (key_shot), WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
 // Controllers: face buttons as on the iPhone, by position (right A, bottom B, top X, left Y) or on a Nintendo pad by its labels (pad_apple.h), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
@@ -9,6 +9,8 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <GameController/GameController.h>
+#import <ImageIO/ImageIO.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
@@ -434,6 +436,24 @@ static void overlay_cycle(void) {
     LOG("front end: overlay %s (key 1)", g_ov_mode == 0 ? "off" : g_ov_mode == 1 ? "compact" : "detailed");
     [g_ov refreshWithCPU:0];
 }
+// Key 3: a screenshot of the picture as shown, to point at a problem while playing: the next presented frame at the window's size (nvn_mtl.m mtl_grab_next_present), as a
+// PNG in DM_SHOT_DIR, else <DM_ROOT>/logs/shots (work/logs/shots for switch2mac.py run, the Application Support folder's for the app), else ~/Pictures. Its log line places it
+// among the frame lines. One at a time: a second press before the next present replaces the first
+void mtl_grab_next_present(void (^cb)(CGImageRef img));
+static void key_shot(void) {
+    const char *d = getenv("DM_SHOT_DIR"), *root = getenv("DM_ROOT");
+    NSString *dir = d && *d ? @(d) : root && *root ? [@(root) stringByAppendingPathComponent:@"logs/shots"] : [NSHomeDirectory() stringByAppendingPathComponent:@"Pictures"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSDateFormatter *f = [NSDateFormatter new]; f.dateFormat = @"yyyyMMdd-HHmmss-SSS";
+    NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"key-%@.png", [f stringFromDate:NSDate.date]]];
+    LOG("front end: screenshot (key 3) of the next presented frame → %s", path.UTF8String);
+    mtl_grab_next_present(^(CGImageRef img) {   // on a Metal completion thread
+        CGImageDestinationRef dst = img ? CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL) : NULL;
+        int ok = 0;
+        if (dst) { CGImageDestinationAddImage(dst, img, NULL); ok = CGImageDestinationFinalize(dst); CFRelease(dst); }
+        if (ok) LOG("front end: screenshot (key 3) saved: %s", path.UTF8String); else LOG("[RED] front end: screenshot (key 3) failed: %s", path.UTF8String);
+    });
+}
 
 typedef struct { void (*fn)(void); } guest_arg;
 static void *guest_tramp(void *p) {
@@ -501,6 +521,7 @@ void front_run(void (*guest)(void)) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
             if (e.keyCode == 18) { if (e.type == NSEventTypeKeyDown && !e.isARepeat) overlay_cycle(); return nil; }   // key 1: the overlay's next mode (not a game button)
+            if (e.keyCode == 20) { if (e.type == NSEventTypeKeyDown && !e.isARepeat) key_shot(); return nil; }   // key 3: a screenshot of the picture as shown (not a game button)
             if (e.keyCode == 19 || (e.keyCode == 53 && g_panel)) { if (e.type == NSEventTypeKeyDown && !e.isARepeat) panel_toggle(); return nil; }   // key 2 (or Esc while it is open): the settings panel
             if (g_panel) return nil;   // the panel is open: no keys reach the game
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);

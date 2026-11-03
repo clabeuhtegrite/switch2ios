@@ -21,6 +21,7 @@ switch2mac is a fork of [nxnative](https://github.com/seedds/nxnative), carried 
 - Opens straight into the game, windowed or full screen.
 - **Key 1**: the performance overlay (top right). Compact (FPS + resolution) → detailed (30-second FPS graph, GPU time, frame time, CPU, memory, the game's frame pacing) → off.
 - **Key 2**: the settings panel (Esc closes it). Display, Performance and Controls; the overlay and full screen change at once, the rest at the next launch.
+- **Key 3**: a screenshot of the picture as shown, as a PNG in the `logs/shots` folder beside your save folder (`work/logs/shots` with `./switch2mac.py run`; `DM_SHOT_DIR` names another), to point at a problem while playing.
 - Controllers (Xbox, PlayStation, Switch Pro and others macOS recognises) and the keyboard.
 - Saves in `~/Library/Application Support/nxnative/0400C3F00006E000/save`, the log in `~/Library/Logs/nxnative/0400C3F00006E000.log`.
 
@@ -99,7 +100,7 @@ If something still looks missing after a while (a shader the list does not cover
 
 ## Controls
 
-Controllers map by position (right button = A, bottom = B, top = X, left = Y; Nintendo pads by label). Keyboard: WASD left stick, arrow keys D-pad, J K U I = A B X Y, Q E = L R, Z C = ZL ZR, Return = +, Tab = −, F / G stick presses, 1 overlay, 2 settings, ⌃⌘F full screen, ⌘Q quit. The mouse is the touchscreen.
+Controllers map by position (right button = A, bottom = B, top = X, left = Y; Nintendo pads by label). Keyboard: WASD left stick, arrow keys D-pad, J K U I = A B X Y, Q E = L R, Z C = ZL ZR, Return = +, Tab = −, F / G stick presses, 1 overlay, 2 settings, 3 screenshot, ⌃⌘F full screen, ⌘Q quit. The mouse is the touchscreen.
 
 ## iPhone (in progress)
 
