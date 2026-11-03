@@ -2988,13 +2988,14 @@ static int tex_tracked_content(const tex_t *t) {
 }
 static id<MTLTexture> tex_mtl_(const tex_t *ct);
 static id<MTLTexture> tex_mtl(const tex_t *ct) { AP_B; id<MTLTexture> r = tex_mtl_(ct); AP_E(4); return r; }
-// Large textures (storage of 64 MB or more, the first 48 made): how each was made, its pool's flags, and what of its storage the process holds before and after, to tell guest pages
-// the game wrote from ones only the host touched (Mario Kart World: 10 textures of 128-256 MB with no packaged layout, about 3.1 GB of Metal memory beside their storage)
+// Large textures (storage of 64 MB or more, the first 48 made): how each was made, its pool and storage (two textures over the same storage with formats that are not merged are two
+// Metal allocations), and what of its storage the process holds before and after, to tell guest pages the game wrote from ones only the host touched (Mario Kart World: 10 textures
+// of 128-256 MB with no packaged layout, about 3.1 GB of Metal memory beside their storage)
 static void big_tex_log(const tex_t *t, id<MTLTexture> mt, const char *how, uint64_t before) {
     static int n; if (n++ >= 48) return;
-    MLOG("[mem] large texture ser=%llu %ux%ux%u format %#x target %d levels %u flags %#x, pool flags %#x: storage %llu MB (%llu MB of it in memory before, %llu MB after), Metal %llu MB, %s; "
+    MLOG("[mem] large texture ser=%llu %ux%ux%u format %#x target %d levels %u flags %#x, pool %p flags %#x: storage %p (pool offset %#llx) %llu MB (%llu MB of it in memory before, %llu MB after), Metal %llu MB, %s; "
          "storage checks so far %llu MB read, %llu MB skipped as never written", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
-         t->d.flags, t->pool ? t->pool->flags : 0, (unsigned long long)(t->L.size >> 20), (unsigned long long)(before >> 20), (unsigned long long)(mem_charged(t->mem, t->L.size) >> 20),
+         t->d.flags, (const void *)t->pool, t->pool ? t->pool->flags : 0, (const void *)t->mem, (unsigned long long)t->off, (unsigned long long)(t->L.size >> 20), (unsigned long long)(before >> 20), (unsigned long long)(mem_charged(t->mem, t->L.size) >> 20),
          (unsigned long long)(mt ? mt.allocatedSize >> 20 : 0), how, (unsigned long long)(atomic_load(&g_mem_any_read) >> 20), (unsigned long long)(atomic_load(&g_mem_any_skip) >> 20));
 }
 // A sparse texture is bound from its first level whose pages, and those of every smaller level, are all mapped: a view of levels [r, n) samples as with a minimum LOD of r.
