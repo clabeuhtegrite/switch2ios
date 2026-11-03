@@ -195,10 +195,32 @@ static void ws_fb(uint64_t fence, double gpu_end) {   // the fence's feedback ha
     ws_wake_pair(k);
 }
 static _Atomic uint64_t g_ws_post[5];
+// Conditional rendering and occlusion queries, also in the [waits] line: render-enable blocks by how replay evaluated them (0 false: not drawn, 1 true, 2 unknown: drawn,
+// 3 SetRenderEnable(false)), 4 the draws met inside a block not drawn; samples-passed results written (0) and those of 0 samples (1). To tell whether an object missing
+// from the picture is a draw a condition dropped or an occlusion query that came out empty (Mario Kart World: trees, cacti and rocks gone while their shadows stay)
+static _Atomic uint64_t g_rc_st[5], g_occ_st[2];
+// DM_NVN_RC_DRAWS=0 (diagnostic): a render-enable block evaluated false still drops its clears but no longer its draws: if a missing object comes back, a condition dropped it
+static int rc_draws_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_RC_DRAWS"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_RC_DRAWS=0: draws inside render-enable blocks evaluated false are drawn (clears there are still dropped; diagnostic)"); }
+    return v;
+}
+// DM_NVN_OCC_VISIBLE=1 (diagnostic): every samples-passed result reads as visible, its sum plus 2^20 for each report since the last reset, so a single query's count and the
+// difference of two reports are both large: if a missing object comes back, an occlusion query hid it. Things the game hides through queries on purpose show too (lens flares,
+// lights behind a wall)
+static int occ_visible_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_OCC_VISIBLE"); v = e && atoi(e) > 0; if (v) MLOG("DM_NVN_OCC_VISIBLE=1: every occlusion query result reads as visible (diagnostic)"); }
+    return v;
+}
 static void ws_report(uint64_t frame, uint64_t frames) {
     char line[2048]; size_t o = 0;
     { uint64_t e = atomic_exchange(&g_ws_post[1], 0), sp = atomic_exchange(&g_ws_post[2], 0), ts = atomic_exchange(&g_ws_post[3], 0), oc = atomic_exchange(&g_ws_post[4], 0);
       if (e + sp + ts + oc) o += snprintf(line + o, sizeof line - o, " CPU-side writes at GPU end: events %.2f, samples-passed reports %.2f, timestamp reports %.2f, other counter reports %.2f;", (double)e / frames, (double)sp / frames, (double)ts / frames, (double)oc / frames); }
+    { uint64_t r[5], q0 = atomic_exchange(&g_occ_st[0], 0), q1 = atomic_exchange(&g_occ_st[1], 0); for (int i = 0; i < 5; i++) r[i] = atomic_exchange(&g_rc_st[i], 0);
+      if (r[0] + r[1] + r[2] + r[3] && o < sizeof line - 200) o += snprintf(line + o, sizeof line - o, " render-enable blocks: evaluated false %.2f, true %.2f, unknown so drawn %.2f, SetRenderEnable(false) %.2f; draws inside blocks not drawn %.2f%s;",
+                                                              (double)r[0] / frames, (double)r[1] / frames, (double)r[2] / frames, (double)r[3] / frames, (double)r[4] / frames, rc_draws_on() ? "" : " (drawn all the same: DM_NVN_RC_DRAWS=0)");
+      if (q0 && o < sizeof line - 120) o += snprintf(line + o, sizeof line - o, " samples-passed results written %.2f, of 0 samples %.2f;", (double)q0 / frames, (double)q1 / frames); }
     uint64_t wn = atomic_exchange(&g_ws_wake_n, 0), wns = atomic_exchange(&g_ws_wake_ns, 0), fns = atomic_exchange(&g_ws_fb_ns, 0);
     if (wn) o += snprintf(line + o, sizeof line - o, " newest-fence SyncWait wakes %.3f ms after the GPU end (feedback handler at %.3f ms);", wns / 1e6 / wn, fns / 1e6 / wn);
     for (int i = 0; i < WS_N; i++) { uint64_t n = atomic_exchange(&g_ws_n[i], 0), b = atomic_exchange(&g_ws_blk[i], 0), ns = atomic_exchange(&g_ws_ns[i], 0);
@@ -726,6 +748,7 @@ static vis_buf g_vis_ring[VIS_RING]; static int g_vis_ring_n, g_vis_ring_i = -1;
 static id<MTLBuffer> g_vis; static uint32_t g_vis_n;   // This submission's visibility buffer and number of slots used
 static int vis_in_ring(id<MTLBuffer> b) { for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].buf == b) return 1; return 0; }
 static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_pass;
+static uint32_t g_vis_nrep;   // samples-passed reports since the last reset (DM_NVN_OCC_VISIBLE)
 static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last reset
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // Report / reset counts per counter type (diagnostics)
 static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
@@ -1755,6 +1778,8 @@ static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
         else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
             vis_list *l = ops[i].vis; uint64_t sum = 0;
             for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
+            atomic_fetch_add_explicit(&g_occ_st[0], 1, memory_order_relaxed); if (!sum) atomic_fetch_add_explicit(&g_occ_st[1], 1, memory_order_relaxed);
+            if (occ_visible_on()) sum += (uint64_t)ops[i].v << 20;   // v: this report's number since the reset
             free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
         }
         else if (ops[i].kind == 4) mirror_rb_land(ops[i].vis);
@@ -11715,13 +11740,14 @@ void mtl_exec(const uint8_t *p) {
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
                 if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2);
-                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }
+                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, 0, ++g_vis_nrep, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)
-                if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
+                if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; if (g_rc_skip) atomic_fetch_add_explicit(&g_rc_st[3], 1, memory_order_relaxed); PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
                 else { uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
                     g_rc_skip = known && (rc->mode ? x == y : x != y);
+                    atomic_fetch_add_explicit(&g_rc_st[!known ? 2 : g_rc_skip ? 0 : 1], 1, memory_order_relaxed);
                     PD("E %llu conditional render %s addr=%#llx values %llu / %llu%s%s", g_stat_pass, rc->mode ? "draw if not equal" : "draw if equal", (unsigned long long)rc->addr, (unsigned long long)x, (unsigned long long)y, known ? "" : " (unknown, drawn)", g_rc_skip ? " → not drawn" : ""); }
                 break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); { int nvn_async_on(void); if (nvn_async_on()) RED_ONCE(921, "a command-buffer FenceSync under DM_NVN_ASYNC_SUBMIT: a SyncWait before the worker reaches it can return early (hle_nvn.c covers queue fences only)"); } s->fence = g_fence + 1; s->fenced = 1;   // the fence value this submission (segment) commits with
@@ -11731,7 +11757,7 @@ void mtl_exec(const uint8_t *p) {
 #ifdef NVN_RT_RANGE_TEST
                     rr_reset();
 #endif
-                    g_vis_on = 1; g_vis_counting = 1; vis_clear();
+                    g_vis_on = 1; g_vis_counting = 1; vis_clear(); g_vis_nrep = 0;
                     // The first reset can come inside a render pass that was begun without a visibility buffer (Octopath Traveler 0: Unreal's occlusion queries, once at boot): split the pass
                     // here, so the continuation is begun with the buffer and its samples are counted (they used not to be: RED "occlusion query counting began in a pass without a visibility buffer")
                     if (g_enc && !g_enc_has_vis) { PD("M %llu occlusion query counting starts: render pass split here", g_stat_pass); rp_end(); } }
@@ -11795,8 +11821,10 @@ void mtl_exec(const uint8_t *p) {
                 PD("c %llu depth-stencil clear recorded ser=%llu depth=%g depth_mask=%d stencil=%d stencil_mask=%#x", g_stat_pass, R.rt.depth ? (unsigned long long)R.rt.depth->serial : 0ull, c->depth, c->depth_mask, c->stencil, c->stencil_mask);
                 break;
             }
-            case OP_DRAW: { if (g_rc_skip) break; p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
-            case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
+            case OP_DRAW: { if (g_rc_skip) { atomic_fetch_add_explicit(&g_rc_st[4], 1, memory_order_relaxed); if (rc_draws_on()) break; }
+                p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
+            case OP_DRAW_IDX: { if (g_rc_skip) { atomic_fetch_add_explicit(&g_rc_st[4], 1, memory_order_relaxed); if (rc_draws_on()) break; }
+                p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_BIND_PROGRAM: { const p_bind_program *b = a; state_op(h.op,a);
                 if (passdump()) { NvProg *pr = S.prog ? prog_get(S.prog) : nil;
