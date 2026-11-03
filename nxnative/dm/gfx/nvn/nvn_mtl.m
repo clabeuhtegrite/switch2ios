@@ -340,6 +340,25 @@ static void want_note(want_list *w, const char *key) {
 static want_list g_bf_want = {"DM_NVN_BF_WANT", PTHREAD_MUTEX_INITIALIZER}, g_dual_want = {"DM_NVN_DUAL_WANT", PTHREAD_MUTEX_INITIALIZER};
 void bf_want_note(const char *key) { want_note(&g_bf_want, key); }
 
+#ifndef MINCORE_PAGED_OUT
+#define MINCORE_PAGED_OUT 0x20
+#endif
+#ifndef MINCORE_ANONYMOUS
+#define MINCORE_ANONYMOUS 0x80
+#endif
+// Bytes of [p, p + n) that the process is charged for, in memory or paged out (mincore), by whole host pages: the large pools' and textures' [mem] lines, which tell what made
+// guest pages count (the game's writes, the zero-copy buffer, residency, the host's reads)
+static uint64_t mem_charged(const void *p, uint64_t n) {
+    uintptr_t pg = vm_page_size, a = (uintptr_t)p & ~(pg - 1), e = ((uintptr_t)p + n + pg - 1) & ~(pg - 1); uint64_t r = 0;
+    enum { CHUNK = 1024 }; char vec[CHUNK];
+    for (; p && a < e; a += CHUNK * pg) {
+        uintptr_t b = MIN(a + CHUNK * pg, e);
+        if (mincore((void *)a, b - a, vec)) continue;   // a hole in the range: left out
+        for (size_t j = 0; j < (b - a) / pg; j++) if (vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) r += pg;
+    }
+    return r;
+}
+
 // ---------- Memory pools ----------
 typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; } pool_ent;   // res: already in the residency set (on demand, see pool_res)
 static pool_ent *g_pools; static int g_npool, g_cap;
@@ -469,9 +488,13 @@ void mtl_init(void) {
     }
     g_ev = [g_dev newSharedEvent];
     g_keep = [NSMutableArray array];
-    g_nvn_deswz_gpu = nvn_deswz_gpu_init(g_dev) == 0;
+    // DM_NVN_DESWZ_GPU=0: swizzled textures deswizzled on the CPU. The GPU deswizzle reads the texture's pool through the pool's zero-copy buffer, which puts the whole pool into
+    // the residency set (pool_res), so a pool that holds only textures becomes resident too: on iOS wired whole, the parts the game never wrote included. For measuring that memory
+    const char *dzg = getenv("DM_NVN_DESWZ_GPU"); int dz_off = dzg && atoi(dzg) == 0;
+    g_nvn_deswz_gpu = !dz_off && nvn_deswz_gpu_init(g_dev) == 0;
     dm_res_report_register(mtl_res_counts);
-    if (!g_nvn_deswz_gpu) MLOG("[RED] GPU deswizzle init failed; swizzled textures fall back to the CPU");
+    if (dz_off) MLOG("GPU deswizzle off (DM_NVN_DESWZ_GPU=0): swizzled textures are deswizzled on the CPU, their pools stay out of the residency set");
+    else if (!g_nvn_deswz_gpu) MLOG("[RED] GPU deswizzle init failed; swizzled textures fall back to the CPU");
     MLOG("Metal device %s", g_dev.name.UTF8String);
     udc_selftest();
 }
@@ -520,9 +543,16 @@ static _Atomic uint64_t g_reg_gen = 1;   // Change generation of memory pool / t
 // (they measured on a 17 Pro Max a 512 MB render-target pool addressed 0 times in a run, with about 530 MB more device wired memory; a 4 GB A14 was ended by the system within seconds of launch because of it).
 // So a pool is not put into the residency set when created; it is put in, and the residency set committed on the spot, the first time the GPU gets its address through mtl_addr / mtl_gpu_addr -- these are the only two ways the GPU gets pool addresses,
 // and committing on the spot is earlier than any command buffer commit that uses it. CPU-side reads of pool contents through mtl_addr trigger it too (conservative, never misses). Caller holds g_mu
-static void pool_res(int i) {
+// The pools put in by each call site that asked for a pool address first (line in this file; 0: another file), for the memory report (mtl_mem_textures); a pool of 64 MB or more is
+// logged with what of it was in memory before and after. DM_NVN_DESWZ_GPU=0 keeps texture uploads from asking (pkg_upload_)
+enum { PR_SITES = 24 }; static struct { int line; uint64_t n, bytes; } g_pr_site[PR_SITES];
+static void pool_res(int i, int line) {
     if (g_pools[i].res) return;
+    uint64_t len = g_pools[i].hi - g_pools[i].base; int big = len >= (64u << 20); uint64_t before = big ? mem_charged((void *)g_pools[i].base, len) : 0;
     res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++;
+    { int k = 0; while (k < PR_SITES - 1 && g_pr_site[k].line != line && g_pr_site[k].n) k++; g_pr_site[k].line = line; g_pr_site[k].n++; g_pr_site[k].bytes += len; }
+    if (big) { static int n; if (n++ < 64) MLOG("[mem] memory pool %#lx resident: %llu MB, %llu MB of it in memory before, %llu MB after; first address asked at nvn_mtl.m:%d%s", (unsigned long)g_pools[i].base,
+                                              (unsigned long long)(len >> 20), (unsigned long long)(before >> 20), (unsigned long long)(mem_charged((void *)g_pools[i].base, len) >> 20), line, line ? "" : " (another file)"); }
 }
 static void grw_release(uint64_t lo, uint64_t hi);   // DM_GPU_READWATCH: a pool's pages are never left inaccessible across its creation / destruction
 void mtl_pool_add(const void *mem, uint64_t size) {
@@ -530,6 +560,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
     grw_release(a, b);
+    uint64_t before = size >= (64u << 20) ? mem_charged((void *)a, b - a) + 1 : 0;   // a large pool: what of it the game has written, before and after its zero-copy buffer ([mem] line below)
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
     // Pokémon Legends: Z-A: twice on the Mac a small pool's buffer was refused although its pages were one read-write VM region, both times while another heavy job (a shader compile,
     // a second game instance) took the machine's memory; every run on an idle machine created all of them. Wiring the pages may fail under memory pressure: retry for up to about 2 s
@@ -547,6 +578,8 @@ void mtl_pool_add(const void *mem, uint64_t size) {
         }
         MDIE("memory pool %p+%#llx: failed to create the zero-copy buffer over %#lx..%#lx", mem, (unsigned long long)size, (unsigned long)a, (unsigned long)b);
     }
+    if (before) { static int n; if (n++ < 64) MLOG("[mem] memory pool %p: %llu MB, %llu MB of it in memory at creation, %llu MB after its zero-copy buffer", mem, (unsigned long long)(size >> 20),
+                                                 (unsigned long long)((before - 1) >> 20), (unsigned long long)(mem_charged((void *)a, b - a) >> 20)); }
     pthread_mutex_lock(&g_mu);
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, g_cap * sizeof *g_pools); }
     g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1);   // the address index and the per-thread caches are invalid (pool_find, pc_get)
@@ -590,26 +623,31 @@ static int pool_find(uint64_t addr, uint64_t len) {
     for (int i = 0; i < g_npool; i++) if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) return g_plast = i;
     return -1;
 }
-int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+static int mtl_addr_at(uint64_t addr, uint64_t len, void **buf, uint64_t *off, int line) {
     const pc_ent *c = pc_get(addr, len);
     if (c) { *buf = (__bridge void *)c->buf; *off = addr - c->base; return 1; }
     int ok = 0;
     pthread_mutex_lock(&g_mu);
     int i = pool_find(addr, len);
-    if (i >= 0) { pool_res(i); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; }
+    if (i >= 0) { pool_res(i, line); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
-int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu) {
+static int mtl_gpu_addr_at(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu, int line) {
     const pc_ent *c = pc_get(addr, len);
     if (c) { *buf = (__bridge void *)c->buf; *off = addr - c->base; *gpu = c->gpu + *off; return 1; }
     int ok = 0;
     pthread_mutex_lock(&g_mu);
     int i = pool_find(addr, len);
-    if (i >= 0) { pool_res(i); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
+    if (i >= 0) { pool_res(i, line); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
+int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) { return mtl_addr_at(addr, len, buf, off, 0); }
+int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu) { return mtl_gpu_addr_at(addr, len, buf, off, gpu, 0); }
+// The rest of this file asks with its line, which pool_res counts the pools it puts in by (the memory report)
+#define mtl_addr(a, n, b, o) mtl_addr_at((a), (n), (b), (o), __LINE__)
+#define mtl_gpu_addr(a, n, b, o, g) mtl_gpu_addr_at((a), (n), (b), (o), (g), __LINE__)
 
 // ---------- Submission ----------
 static void defer_reset(void); static void defer_fallback(void);
@@ -2788,10 +2826,33 @@ static void tex_zero_fill(id<MTLTexture> mt) {
 // content there too, flushed or not. Donkey Kong Country: Tropical Freeze's title logo and menu panels (ASTC 5x5, no packaged layout) sit in CPU_UNCACHED | GPU_CACHED pools
 // (flags 0x22) whose storage holds their texels at first use (the 912x512 logo: 242,374 of 376,832 bytes non-zero), never flushed; as GPU textures of zeros they were magenta
 int nvn_flushed(const void *p, uint64_t n);   // hle_nvn.c
-static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-zero (stops at the first)
+// Pages never written are skipped, not read: anonymous memory that is neither in memory nor paged out (mincore) has not been written since it was mapped and reads as zeros, and
+// reading it to find that out makes the kernel give it a page (Darwin has no shared zero page; a read fault fills a new page with zeros), charged to the process from then on, on
+// iOS too, where the compressor keeps even a page of zeros in the footprint. mem_any is asked about a texture's whole storage at its first use (tex_init_fill, tex_cpu_content,
+// tex_tracked_content), large render targets included (Mario Kart World: 128-256 MB each). A file's page, or a range mincore cannot report, is read as before.
+// DM_NVN_MEMANY_MINCORE=0 reads every page
+static _Atomic uint64_t g_mem_any_read, g_mem_any_skip;   // bytes read, bytes skipped as never written (the large-texture [mem] lines, the memory report)
+static int mem_any_plain(const uint8_t *p, uint64_t n) {
     uint64_t i = 0, v;
     for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); if (v) return 1; }
     for (; i < n; i++) if (p[i]) return 1;
+    return 0;
+}
+static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-zero (stops at the first)
+    static int mc = -1; if (mc < 0) { const char *e = getenv("DM_NVN_MEMANY_MINCORE"); mc = !e || atoi(e) != 0; }
+    uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n;
+    if (!mc || n < 4 * pg) { atomic_fetch_add_explicit(&g_mem_any_read, n, memory_order_relaxed); return mem_any_plain(p, n); }
+    enum { CHUNK = 1024 }; char vec[CHUNK];   // pages per mincore call
+    for (uintptr_t a = s & ~(pg - 1); a < e; a += CHUNK * pg) {
+        uintptr_t b = MIN(a + CHUNK * pg, (e + pg - 1) & ~(pg - 1));
+        int ok = !mincore((void *)a, b - a, vec);
+        for (size_t j = 0; j < (b - a) / pg; j++) {
+            uintptr_t lo = MAX(a + j * pg, s), hi = MIN(a + (j + 1) * pg, e);
+            if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && (vec[j] & MINCORE_ANONYMOUS)) { atomic_fetch_add_explicit(&g_mem_any_skip, hi - lo, memory_order_relaxed); continue; }
+            atomic_fetch_add_explicit(&g_mem_any_read, hi - lo, memory_order_relaxed);
+            if (mem_any_plain((const uint8_t *)lo, hi - lo)) return 1;
+        }
+    }
     return 0;
 }
 static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
@@ -2927,6 +2988,15 @@ static int tex_tracked_content(const tex_t *t) {
 }
 static id<MTLTexture> tex_mtl_(const tex_t *ct);
 static id<MTLTexture> tex_mtl(const tex_t *ct) { AP_B; id<MTLTexture> r = tex_mtl_(ct); AP_E(4); return r; }
+// Large textures (storage of 64 MB or more, the first 48 made): how each was made, its pool's flags, and what of its storage the process holds before and after, to tell guest pages
+// the game wrote from ones only the host touched (Mario Kart World: 10 textures of 128-256 MB with no packaged layout, about 3.1 GB of Metal memory beside their storage)
+static void big_tex_log(const tex_t *t, id<MTLTexture> mt, const char *how, uint64_t before) {
+    static int n; if (n++ >= 48) return;
+    MLOG("[mem] large texture ser=%llu %ux%ux%u format %#x target %d levels %u flags %#x, pool flags %#x: storage %llu MB (%llu MB of it in memory before, %llu MB after), Metal %llu MB, %s; "
+         "storage checks so far %llu MB read, %llu MB skipped as never written", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
+         t->d.flags, t->pool ? t->pool->flags : 0, (unsigned long long)(t->L.size >> 20), (unsigned long long)(before >> 20), (unsigned long long)(mem_charged(t->mem, t->L.size) >> 20),
+         (unsigned long long)(mt ? mt.allocatedSize >> 20 : 0), how, (unsigned long long)(atomic_load(&g_mem_any_read) >> 20), (unsigned long long)(atomic_load(&g_mem_any_skip) >> 20));
+}
 // A sparse texture is bound from its first level whose pages, and those of every smaller level, are all mapped: a view of levels [r, n) samples as with a minimum LOD of r.
 // The translator drops TEX's LOD clamp and residency predicate, so Monster Hunter Rise's streamed textures were sampled at levels it had not mapped yet; those read 0, which ASTC
 // decodes as its error colour (magenta clothes on the title screen). Single-layer 2D textures only; the view follows each upload, as the mappings change only with one
@@ -3057,8 +3127,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         }
         pk = [NvPkg new];
         pk->sparse = t->pool && nvn_sparse_pool(t->pool); pk->vgen = pk->vseen = nvn_sparse_gen();
+        uint64_t big = t->L.size >= (64u << 20) ? mem_charged(t->mem, t->L.size) + 1 : 0;   // big_tex_log
         pk->tex = pkg_upload(t, &pk->stamp, nil, 0);
         if (!pk->tex) return nil;
+        if (big) big_tex_log(t, pk->tex, pk->sparse ? "sparse, uploaded from its mapped pages" : t->has_layout ? "packaged, uploaded from its storage" : "CPU-written, uploaded from its storage", big - 1);
         pk->span = nvn_dirty_span(t->mem, t->L.size);
         pk->seen = pk->stamp; g_pkg_uploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size);   // "nothing written since" starts at the stamp: a write that faulted during the upload moved "now" past it
         pkg_edges_take(pk, t);
@@ -3125,15 +3197,18 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
             }
         }
     }
+    uint64_t big = t->mem && t->L.size >= (64u << 20) ? mem_charged(t->mem, t->L.size) + 1 : 0;   // big_tex_log
+    const char *how = "linear, over its pool's buffer";
     id<MTLTexture> mt = tex_linear(t);
     if (!mt) {
         MTLTextureDescriptor *d = tex_desc(t, 0);
         if (!d) return nil;
-        mt = image_texture(t, d);
-        if (!mt) { mt = [g_dev newTextureWithDescriptor:d];
-            if (mt) { res_add(mt); if (!tex_init_fill(t, mt)) tex_zero_fill(mt); } }
+        mt = image_texture(t, d); how = "in an image heap";
+        if (!mt) { mt = [g_dev newTextureWithDescriptor:d]; how = "a GPU texture, zero-filled up to 64 MB";
+            if (mt) { res_add(mt); if (tex_init_fill(t, mt)) how = "a GPU texture, filled once from its storage"; else tex_zero_fill(mt); } }
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
     }
+    if (big) big_tex_log(t, mt, how, big - 1);
     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
     if (getenv("DM_NVN_TEXCPU") && t->pool && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) MLOG("non-swizzled texture on a CPU-visible pool ser=%llu %ux%ux%u format %#x target %d levels %u texture flags %#x pool flags %#x storage %p", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, t->d.flags, t->pool->flags, (void *)t->mem);
     res_add(mt);
@@ -12529,9 +12604,6 @@ void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_allo
 //   pipelines: render, mesh, compute and pulling pipelines and pulling bases built so far, a count (the tables are read without their locks: a count a moment old)
 // Bytes but the count. Called on the memstat thread; it takes g_mu, g_smu and g_res_mu one after the other, never two at once
 enum { MK_POOL_RES, MK_POOL_ALL, MK_PKG, MK_TEX, MK_HEAP, MK_BUF, MK_ALLOC, MK_GUEST_POOLS, MK_PSO, MK_N };
-#ifndef MINCORE_PAGED_OUT
-#define MINCORE_PAGED_OUT 0x20
-#endif
 static int mk_ptr_cmp(const void *a, const void *b) { uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b; return (x > y) - (x < y); }
 static int mk_ptr_in(const uintptr_t *v, int n, uintptr_t p) {
     int lo = 0, hi = n - 1;
@@ -12627,7 +12699,13 @@ void mtl_mem_textures(FILE *f) { @autoreleasepool {
             id<MTLHeap> h = o; fprintf(f, "heap\t%.3f\t%lu\t\t\t\t\t\t\t\t\t%lu\n", h.size / 1048576.0, (unsigned long)h.usedSize, (unsigned long)h.storageMode);
         }
     }
-    for (int i = 0; i < np; i++) fprintf(f, "%s\t%.3f\t%#lx\n", pp[i].res ? "pool resident" : "pool", pp[i].len / 1048576.0, (unsigned long)pp[i].lo);
+    fprintf(f, "\nkind\tMiB\taddress\tMiB in memory or paged out\n");
+    for (int i = 0; i < np; i++) fprintf(f, "%s\t%.3f\t%#lx\t%.3f\n", pp[i].res ? "pool resident" : "pool", pp[i].len / 1048576.0, (unsigned long)pp[i].lo, mem_charged((void *)pp[i].lo, pp[i].hi - pp[i].lo) / 1048576.0);
+    fprintf(f, "\npools put into the residency set by the call site that first asked for an address (nvn_mtl.m line; 0: another file)\nline\tpools\tMiB\n");
+    pthread_mutex_lock(&g_mu);
+    for (int k = 0; k < PR_SITES && g_pr_site[k].n; k++) fprintf(f, "%d\t%llu\t%.1f\n", g_pr_site[k].line, (unsigned long long)g_pr_site[k].n, g_pr_site[k].bytes / 1048576.0);
+    pthread_mutex_unlock(&g_mu);
+    fprintf(f, "\nstorage checks (mem_any)\t%.1f MiB read\t%.1f MiB skipped as never written\n", atomic_load(&g_mem_any_read) / 1048576.0, atomic_load(&g_mem_any_skip) / 1048576.0);
     free(pp); free(pb); free(pk);
 } }
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)

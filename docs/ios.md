@@ -45,6 +45,8 @@ LiveContainer runs the app inside its own process, so the app has LiveContainer'
 | `DM_MEMSTAT=<file>` | memory every second: footprint, what iOS has left, Metal, and the guest / code / malloc / GPU split |
 | `DM_REGIONS=<file>` | the game's address regions every 2 s, with what is mapped in each |
 | `DM_OPMODE=0` | handheld mode |
+| `DM_NVN_DESWZ_GPU=0` | textures deswizzled on the CPU: a pool that holds only textures never becomes resident, which on iOS wires the whole pool |
+| `DM_NVN_MEMANY_MINCORE=0` | storage checks read every page again, the never-written ones included (to measure what skipping them saves) |
 
 Sizes are bytes, or whole K / M / G (`DM_APP_POOL=4G`). The guest block is 256 MB + alias region + 256 MB of stacks + heap region; its size and parts are logged at start (`[mem] guest block`).
 
@@ -53,6 +55,7 @@ Sizes are bytes, or whole K / M / G (`DM_APP_POOL=4G`). The guest block is 256 M
 On the Mac first, where a run that fails costs a minute:
 
 1. `./switch2mac.py run --phone`: the phone's switches and launcher defaults (handheld, pipelines through the MTLDevice as on iOS), with `work/logs/memstat-*.tsv` and `regions-*.tsv` beside the log. Play the same route each time (title, a Grand Prix race, some free roam). The `[mem]` lines give the heap the game asks for and how deep it uses the alias region.
+   The `[mem] memory pool` and `[mem] large texture` lines say what of the large pools and textures is in memory and what put it there; the control file's `texmem <path>` lists every Metal allocation and pool at that moment.
    `tools/memstat.py` sums the statistics up (peak, median, a timeline, the time above the budget; `--from` / `--to` for one part of the route); `run --phone` prints it when the game exits, and it reads the phone's `Documents/memstat.tsv` as well.
 2. Smaller layouts: `./switch2mac.py run --phone DM_APP_POOL=… DM_HEAP_REGION=… DM_ALIAS_SIZE=…`. Whether the game runs with less than its 9.5 GB, and with how much, is the open question.
 3. The target for a phone without extended virtual addressing: a guest block under about 5.5 GB, and a footprint (`memstat`) under about 5.5 GB through a whole race.
