@@ -272,13 +272,20 @@ DISK_POLL, DISK_EVERY, DISK_AFTER, DISK_SAMPLE = 2, 30, 30, 10   # seconds: the 
 def gb(n): return '?' if n is None else f'{n / GB:.1f}'
 
 
+def host_temp():   # the host's folder for the guest file without DM_GUEST_FILE_DIR: on macOS confstr(_CS_DARWIN_USER_TEMP_DIR), which ignores TMPDIR (hle_svc.c guest_file_init)
+    if sys.platform == 'darwin':
+        try: return os.confstr(65537) or tempfile.gettempdir()   # _CS_DARWIN_USER_TEMP_DIR
+        except (OSError, ValueError): pass
+    return tempfile.gettempdir()
+
+
 def disk_free(d):   # bytes free to this user on the disk of folder d (statvfs f_bavail, as the host's guest file lines read it), or None when it cannot be read
     try: return shutil.disk_usage(d).free
     except OSError: return None
 
 
 def disk_guard(p, d, free0, t0, done, stopped, out):
-    """run's disk guard while the game runs (DM_DISK_GUARD=0 turns it off): the room left on the disk of the guest file's folder every 2 s and in the log every 30 s, and under 5 GB the game
+    """run's disk guard while the game runs (on with DM_GUEST_FILE, DM_DISK_GUARD=1 or 0 forces it): the room left on the disk of the guest file's folder every 2 s and in the log every 30 s, and under 5 GB the game
     is stopped before the disk fills, with SIGTERM (the host's graceful exit), then SIGKILL 5 s later. With DM_GUEST_FILE the kernel writes the guest's pages out to a file in
     that folder, and macOS swaps to the same disk when memory runs short; what either does on a full disk was not tried. The signals do not wait on the lines, since writing one waits for the
     terminal, which may have stopped reading: SIGTERM goes before the [RED] line, and SIGKILL comes from a thread of its own (the host logs before it arms its own 1.5 s exit, and that log line
@@ -396,9 +403,11 @@ def run_game(a):
     log = w / 'logs' / f'run-{stamp}.log'
     print(' '.join(f'{k}={e[k]}' for k in sorted(e) if k.startswith('DM_')) + ' ' + ' '.join(cmd))
     if a.print: return
-    guard = e.get('DM_DISK_GUARD') != '0'   # disk_guard: on unless DM_DISK_GUARD=0
+    gfile = re.match(r'\s*\+?(\d+)', e.get('DM_GUEST_FILE', ''))   # as the host reads it (hle_svc.c guest_file_init: atoi > 0)
+    guard = {'1': True, '0': False}.get(e.get('DM_DISK_GUARD'), bool(gfile and int(gfile[1]) > 0))   # disk_guard: on with the guest file (run --phone), DM_DISK_GUARD=1 or 0 forces it
     smp = w / 'logs' / f'disk-{stamp}.tsv' if {'1': True, '0': False}.get(e.get('DM_DISK_SAMPLER'), a.phone) else None   # disk_sampler: on with --phone, unless DM_DISK_SAMPLER says
-    gd = (e.get('DM_GUEST_FILE_DIR') or tempfile.gettempdir()) if guard or smp else None   # the guest file's folder (hle_svc.c guest_file_init), whose disk the guard watches
+    gd = (e.get('DM_GUEST_FILE_DIR') or host_temp()) if guard or smp else None   # the guest file's folder (hle_svc.c guest_file_init), whose disk the guard watches
+    if gd and not os.path.isabs(gd): gd = str(r / gd)   # a relative DM_GUEST_FILE_DIR is the host's, whose working directory is the run folder
     free0 = first = None
     if guard:   # the room to start with, or the run stops here
         where = f'{"DM_GUEST_FILE_DIR" if e.get("DM_GUEST_FILE_DIR") else "the temporary folder"} ({gd})'
@@ -406,9 +415,10 @@ def run_game(a):
         except OSError as x: first = f'[switch2mac] [RED] [disk] cannot read the free space on the disk of {where} ({x}): no disk guard in this run\n'
         else:
             if free0 < DISK_START:
-                sys.exit(f'stopped: {gb(free0)} GB free on the disk of {where}, under {DISK_START // GB} GB. A run takes room there as it goes: with DM_GUEST_FILE=1 (the iPhone settings, '
-                         f"run --phone) the kernel writes the guest's memory out to a file in that folder, up to all the game has touched, and macOS swaps to that disk when memory runs "
-                         f'short; under {DISK_STOP // GB} GB the run stops the game. Make room, or run with DM_DISK_GUARD=0 to start anyway')
+                sys.exit(f'stopped: {gb(free0)} GB free on the disk of {where} (as statvfs counts it, without the space macOS could purge), under {DISK_START // GB} GB. A run takes room '
+                         f"there as it goes: with DM_GUEST_FILE=1 (the iPhone settings, run --phone) the kernel writes the guest's memory out to a file in that folder, up to all the game "
+                         f'has touched, and macOS swaps to that disk when memory runs short; under {DISK_STOP // GB} GB the run stops the game. Make room, or run with DM_DISK_GUARD=0 to '
+                         f'start anyway')
             first = f'[switch2mac] [disk] {gb(free0)} GB free on the disk of {where} at the start: the game is stopped under {DISK_STOP // GB} GB (DM_DISK_GUARD=0 turns this off)\n'
     print(f'log: {log}', flush=True)
     if smp: print(f'disk statistics: {smp}', flush=True)
@@ -426,6 +436,7 @@ def run_game(a):
         if smp: jobs.append(threading.Thread(target=disk_sampler, args=(smp, gd, t0, done), daemon=True))
         for j in jobs: j.start()
         for line in p.stdout: out(line)
+        with lock: f.close()   # under out()'s lock, which checks f.closed and writes as one step: a guard line from here on is appended to the closed log
     rc = p.wait(); done.set(); t1 = time.monotonic()
     for j in jobs: j.join(25)   # the guard's last line before the ones below, and the sampler's last row, as the game exits (each tool gets 10 s)
     fx = disk_free(gd) if free0 is not None else None
