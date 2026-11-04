@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include "game_profile.h"   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
 
 // Explicit host work does not occupy a guest core (Metal submission, or a blocked native codec lock). A contended host mutex must count as blocked: a signal's same-core handoff
@@ -89,6 +90,19 @@ int nro_refused(const uint8_t sha256[32]);      // an NRO the pack refused (an o
 void nro_load(module_t *m);     // relocate an NRO against the loaded modules and bind the earlier modules' imports it defines (the caller runs its init)
 void nro_unload(module_t *m);   // take an NRO out of the lookups and bind the imports that pointed into it again
 int svc_nro_deactivate(module_t *m);   // mark inactive under the memory map lock, refusing while a stack borrows its data
+int svc_guest_file_fd(void);   // the guest file's descriptor while the block lies in one file, mapping it from offset 0 (DM_GUEST_FILE, hle_svc.c: read and write); -1 while the guest is anonymous, and with several files (DM_GUEST_FILE_CHUNK: svc_guest_file_at)
+// The files that hold the guest block (DM_GUEST_FILE; several with DM_GUEST_FILE_CHUNK, where an offset from the block's base is wrong past the first file), file i mapping its part of the
+// block from its offset 0, so that an address's file and offset come from svc_guest_file_at (that file's part starts at a - *off), and a range past the hi it gives goes on in the next file:
+// one lseek, pread or F_PUNCHHOLE per file, st_blocks summed over svc_guest_file_nth, fstatfs of file 0 for the volume they all lie on. Filled once at init and never changed afterwards: any
+// thread may read them without a lock. Output pointers may be NULL
+int svc_guest_files(void);   // how many files hold the guest block, 0 while it is anonymous
+int svc_guest_file_nth(int i, uintptr_t *lo, uintptr_t *hi);   // descriptor of file i and the guest addresses [lo, hi) it maps; -1 when i is out of range
+int svc_guest_file_at(uintptr_t a, off_t *off, uintptr_t *hi);   // descriptor of the file that maps a, a's offset in that file, and the end of that file's range; -1 outside the block or while anonymous
+// DM_GUEST_FILE_PUNCH (hle_svc.c): before each punch of the host pages [lo, hi), every veto registered is asked once about the whole range (with several files the punch is then one
+// F_PUNCHHOLE in each file the range spans). It runs on the SVC's thread under the memory map lock, which every memory SVC takes, so it must not block or call into hle_svc.c: it
+// try-locks, and answers non-zero when a lock is busy or it cannot tell. Up to 8; registering one again does nothing
+typedef int (*dm_punch_veto_fn)(uintptr_t lo, uintptr_t hi);   // non-zero: do not punch [lo, hi)
+void dm_guest_punch_veto_register(dm_punch_veto_fn fn);
 void *module_sym(module_t *m, const char *name);
 int dm_sdk_major(void);   // SDK major version from the sdk module's version string (loader.c); 0 = unknown
 #define DM_SDK_OLD(major) ((major) > 0 && (major) <= 10)   // SDK 10 and older: NVN API 53, the shared-font address points at the TTF itself
