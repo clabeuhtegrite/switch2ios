@@ -3667,7 +3667,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
 }
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
-typedef struct { unsigned n, cap, ways, views, extra; uint64_t hit, made, clears, m_set, m_key, m_base, evict, grown; } mtl_vc_stat;   // the texture view cache (vc_get), for the memory report
+typedef struct { unsigned n, cap, ways, views, extra, wmax; uint64_t hit, made, clears, m_set, m_key, m_base, evict, grown; } mtl_vc_stat;   // the texture view cache (vc_get), for the memory report
 void mtl_vc_stats(mtl_vc_stat *o);
 // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
@@ -3696,10 +3696,10 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
     { void mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); mtl_vc_stat vs; uint64_t tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vs); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
-      MLOG("texture views by texture (vc_get): %u textures hold %u cached views (at most %u textures, emptied at that cap %llu times; up to %u views a texture, %u places added now, %llu times in all); %llu views reused, %llu made in total "
+      MLOG("texture views by texture (vc_get): %u textures hold %u cached views (at most %u textures, emptied at that cap %llu times; up to %u views a texture, the most a texture got %u, %u places added now, %llu times in all); %llu views reused, %llu made in total "
            "(lookups that missed: no entry %llu, key not held %llu, held only from a replaced base %llu; views replaced %llu); texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
            "(tbuf_as_2d); texture type mismatches no view bridges %llu in total (tex_mis_note)",
-           vs.n, vs.views, vs.cap, (unsigned long long)vs.clears, vs.ways, vs.extra, (unsigned long long)vs.grown, (unsigned long long)vs.hit, (unsigned long long)vs.made,
+           vs.n, vs.views, vs.cap, (unsigned long long)vs.clears, vs.ways, vs.wmax, vs.extra, (unsigned long long)vs.grown, (unsigned long long)vs.hit, (unsigned long long)vs.made,
            (unsigned long long)vs.m_set, (unsigned long long)vs.m_key, (unsigned long long)vs.m_base, (unsigned long long)vs.evict,
            (unsigned long long)tb, (unsigned long long)tm, (unsigned long long)tf, (unsigned long long)tc, (unsigned long long)(tcb >> 20), (unsigned long long)mtl_tex_mis_count()); }
     if (g_allocprof > 0) { char ab[256]; int o = 0; for (int i = 0; i < g_alloc_n && o < 200; i++) o += snprintf(ab + o, sizeof ab - o, " #%d %llu MB", i, (unsigned long long)(g_alloc4[i].allocatedSize >> 20));
@@ -5064,19 +5064,20 @@ static void treg_finish_submission(void) {
 // registrations ended in a new Metal texture view, 45% of the replay's time. A hit is checked against the current base texture (re-uploads and format-view upgrades replace it).
 // Only live textures are cached; entries go when the texture is finalized (mtl_tex_release) or its pool is (treg_drop_pool_views), and all of them past vc_cap() textures. Under g_rmu
 // DM_NVN_VC_MAX=<n> (64 to 1048576) caps the textures that hold cached views, VC_MAX by default. A texture has VC_WAYS places for views, the oldest view replaced first.
-// DM_NVN_VC_WAYS=<n> (4 to 256; 4 is the default) lets a texture whose places are all taken get more, doubling up to n, while fewer than VC_GROW_PLACES places were added in all; it also
-// fills an empty place before replacing a view, and past a view made from a replaced base texture it looks on through the other places. Mario Kart World's menus reused no view at
+// DM_NVN_VC_WAYS=<n> (4 to 256; 4 is the default) lets a texture that has replaced as many views as it has places since it last got more get more, doubling up to n, while fewer than
+// VC_GROW_PLACES places were added in all (a texture that sees a new key once does not take them); it also fills an empty place before replacing a view, and past a view made from
+// a replaced base texture it looks on through the other places. Mario Kart World's menus reused no view at
 // all (phone test 3, t=546-646; Mac run A, t=168-235): about 21 views a frame were made for the same 4,100 textures holding views, with no new texture serial, no storage takeover
 // and no re-upload meanwhile, so each lookup missed with a key the texture's 4 places no longer held (inferred: more view keys a texture than places, in a cycle). While views were
 // made that way malloc rose 2.5 to 3.6 KiB a view made (about 300 MiB on the phone, 175 on the Mac), and it came down once views were reused again. Kept views are driver objects
 // in malloc, outside memstat's texture columns. The log's texture views line counts the misses by kind, the views replaced and the places added
 typedef struct { uint32_t pf, l0, nl, s0, ns; uint8_t tt, sw[4], pad[3]; } vc_key;
-enum { VC_WAYS = 4, VC_MAX = 16384, VC_WAYS_TOP = 256, VC_GROW_PLACES = 4096 };
+enum { VC_WAYS = 4, VC_MAX = 16384, VC_WAYS_TOP = 256, VC_GROW_PLACES = 16384 };
 typedef struct { vc_key k; void *view; } vc_way;   // view: retained
-typedef struct { const void *pool; unsigned next, nw; void *rows, *rows_of; uint64_t rows_rid, rows_n; vc_way w[]; } vc_set;   // nw: its places (w); rows: a texture buffer as 2D rows (tbuf_as_2d; retained, resident), rows_of / rows_n: the buffer texture it was made from and its element count
+typedef struct { const void *pool; unsigned next, nw, ev; void *rows, *rows_of; uint64_t rows_rid, rows_n; vc_way w[]; } vc_set;   // nw: its places (w); ev: views it replaced since it got places; rows: a texture buffer as 2D rows (tbuf_as_2d; retained, resident), rows_of / rows_n: the buffer texture it was made from and its element count
 static nvn_hmap g_vc = {.klen = 8};   // texture serial → vc_set
 static uint64_t g_vc_hit, g_vc_new, g_vc_clears, g_vc_m_set, g_vc_m_key, g_vc_m_base, g_vc_evict, g_vc_grown;   // misses: no entry, key not held, held only from a replaced base
-static unsigned g_vc_views, g_vc_extra;   // views the cache holds; places beyond VC_WAYS its textures have
+static unsigned g_vc_views, g_vc_extra, g_vc_wmax = VC_WAYS;   // views the cache holds; places beyond VC_WAYS its textures have; the most places a texture got
 static unsigned vc_cap(void) {   // under g_rmu
     static unsigned v;
     if (!v) {
@@ -5091,7 +5092,7 @@ static unsigned vc_ways(void) {   // under g_rmu: the places a texture may get
     if (!v) {
         const char *e = getenv("DM_NVN_VC_WAYS"); long n = e && *e ? strtol(e, NULL, 10) : 0;
         v = n >= VC_WAYS && n <= VC_WAYS_TOP ? (unsigned)n : VC_WAYS;
-        if (e && *e) MLOG("DM_NVN_VC_WAYS=%s: a texture keeps up to %u cached texture views (default %u), places added while fewer than %u were added in all%s", e, v, (unsigned)VC_WAYS, (unsigned)VC_GROW_PLACES, v == (unsigned long)n ? "" : "; the value is outside 4 to 256, so the default applies");
+        if (e && *e) MLOG("DM_NVN_VC_WAYS=%s: a texture keeps up to %u cached texture views (default %u), more places once it replaced as many views as it has, while fewer than %u were added in all%s", e, v, (unsigned)VC_WAYS, (unsigned)VC_GROW_PLACES, v == (unsigned long)n ? "" : "; the value is outside 4 to 256, so the default applies");
     }
     return v;
 }
@@ -5131,20 +5132,21 @@ static void vc_put(uint64_t ser, const void *pool, const vc_key *k, id<MTLTextur
     unsigned i = s->nw, top = vc_ways();
     if (top > VC_WAYS) {   // DM_NVN_VC_WAYS: an empty place first, else more places (the entry moves: the table gets its new address)
         for (i = 0; i < s->nw && s->w[i].view; i++) {}
-        if (i == s->nw && s->nw < top && g_vc_extra < VC_GROW_PLACES) {
+        if (i == s->nw && s->nw < top && s->ev >= s->nw && g_vc_extra < VC_GROW_PLACES) {
             unsigned nw = s->nw * 2 < top ? s->nw * 2 : top;
             vc_set *g = realloc(s, sizeof *s + nw * sizeof(vc_way));
-            if (g) { memset(g->w + g->nw, 0, (nw - g->nw) * sizeof(vc_way)); g_vc_extra += nw - g->nw; g->nw = nw; nvn_hm_put(&g_vc, &ser, g); s = g; g_vc_grown++; }
+            if (g) { memset(g->w + g->nw, 0, (nw - g->nw) * sizeof(vc_way)); g_vc_extra += nw - g->nw; g->nw = nw; g->ev = 0; nvn_hm_put(&g_vc, &ser, g); s = g; g_vc_grown++;
+                     if (nw > g_vc_wmax) g_vc_wmax = nw; }
         }
     }
     if (i >= s->nw) i = s->next++ % s->nw;
-    if (s->w[i].view) { defer_obj_unref((__bridge id)s->w[i].view); CFRelease(s->w[i].view); g_vc_evict++; } else g_vc_views++;
+    if (s->w[i].view) { defer_obj_unref((__bridge id)s->w[i].view); CFRelease(s->w[i].view); g_vc_evict++; s->ev++; } else g_vc_views++;
     s->w[i].k = *k; s->w[i].view = (void *)CFBridgingRetain(v); g_vc_new++;
 }
 void mtl_vc_drop(uint64_t ser) { os_unfair_lock_lock(&g_rmu); vc_set *s = nvn_hm_del(&g_vc, &ser); if (s) vc_set_free(s); os_unfair_lock_unlock(&g_rmu); }
 void mtl_vc_stats(mtl_vc_stat *o) {
     os_unfair_lock_lock(&g_rmu);
-    *o = (mtl_vc_stat){ g_vc.n, vc_cap(), vc_ways(), g_vc_views, g_vc_extra, g_vc_hit, g_vc_new, g_vc_clears, g_vc_m_set, g_vc_m_key, g_vc_m_base, g_vc_evict, g_vc_grown };
+    *o = (mtl_vc_stat){ g_vc.n, vc_cap(), vc_ways(), g_vc_views, g_vc_extra, g_vc_wmax, g_vc_hit, g_vc_new, g_vc_clears, g_vc_m_set, g_vc_m_key, g_vc_m_base, g_vc_evict, g_vc_grown };
     os_unfair_lock_unlock(&g_rmu);
 }
 static void vc_drop_pool(const void *pool) {   // caller holds g_rmu
