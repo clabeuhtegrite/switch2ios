@@ -190,7 +190,7 @@ static void *guest_file_thread(void *arg) {
         struct statfs fs; struct rusage_info_v4 ru; task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
         int fs_ok = !fstatfs(fd, &fs); double avail = fs_ok ? (double)fs.f_bavail * fs.f_bsize / G : -1;
         if (fs_ok && g_gf_min_free && (uint64_t)fs.f_bavail * fs.f_bsize < g_gf_min_free) {
-            LOG("[RED] [mem] guest file: %.1f GB free on its disk, under %.1f: stopping the game", avail, g_gf_min_free / G);
+            LOG("[RED] [mem] guest file: %.1f GB free on its disk, under %.1f: stopping the game (the free space statfs gives, f_bavail, which leaves out space the system could purge)", avail, g_gf_min_free / G);
             _exit(87);
         }
         if (sec % 10) continue;

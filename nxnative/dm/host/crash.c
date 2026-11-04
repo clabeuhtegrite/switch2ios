@@ -238,7 +238,7 @@ void crash_thread_init(void) {
     pthread_setspecific(g_altstack_key, ss.ss_sp);
 }
 void crash_install(void) {
-    { const char *c = getenv("DM_FAULT_RETRY_CAP"), *gf = getenv("DM_GUEST_FILE");   // the cap on claims that leave a thread where it was (above): before crash_thread_init, which reads it
+    { const char *c = getenv("DM_FAULT_RETRY_CAP"), *gf = getenv("DM_GUEST_FILE");   // the cap on claims that leave a thread where it was (above): set before the handlers below are installed, which read it (on_crash, on threads with the alternate-stack key)
       g_claim_cap = c && *c ? (atoi(c) > 0 ? (unsigned)atoi(c) : 0) : gf && atoi(gf) > 0 ? 256 : 0;
       if (g_claim_cap) LOG("page fault hooks: a fault claimed %u times in a row with nothing changed, at a page that does not come in, takes the crash path (DM_FAULT_RETRY_CAP%s)", g_claim_cap, c && *c ? "" : ", on with DM_GUEST_FILE"); }
     crash_thread_init();

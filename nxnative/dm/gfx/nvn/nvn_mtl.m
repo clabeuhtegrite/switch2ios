@@ -416,7 +416,7 @@ static int gf_hole(gf_ext *x, uintptr_t lo, uintptr_t hi) {   // whether [lo, hi
         atomic_fetch_add_explicit(&g_gf_asks, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_gf_ask_ns, dt, memory_order_relaxed);
         while (dt > m && !atomic_compare_exchange_weak_explicit(&g_gf_ask_max, &m, dt, memory_order_relaxed, memory_order_relaxed)) {}
         if (dt > 4000000) { static _Atomic uint64_t nslow; uint64_t k = atomic_fetch_add(&nslow, 1) + 1;   // an ask that waited on the file stalls the submit thread: said in the log, in the frame it falls in, not only in texmem
-            if (k <= 4 || !(k & (k - 1))) MLOG("[RED] [mem] guest file: finding the extent at %#llx took %.1f ms on this thread (%llu such asks so far; the totals are in texmem)", (unsigned long long)o, dt / 1e6, (unsigned long long)k); }
+            if (k <= 4 || !(k & (k - 1))) MLOG("[RED] [mem] guest file: finding the extent at %#llx of the file that maps %#lx took %.1f ms on this thread (%llu such asks so far; the totals are in texmem)", (unsigned long long)o, (unsigned long)lo, dt / 1e6, (unsigned long long)k); }
         x->lo = lo;
         if (d > o) { x->hi = fb + (uintptr_t)MIN(d, size); x->hole = 1; }   // a hole up to the next data
         else if (d < 0 && err == ENXIO) { x->hi = fe; x->hole = 1; }   // no data from o on: a hole to the end of this file
