@@ -4,7 +4,7 @@
 // offset 0 (hle_svc.c guest_files_map), so a memory pool across a file boundary lies in two VM objects (two vnodes), which no run with the game has tried yet. This does the same with
 // three unlinked sparse files of 256 MB in the temporary folder (or the folder given), puts a 64 MB pool over the boundary of files 0 and 1 and a control pool inside file 2, and for each:
 // writes half of it with the CPU and writes a quarter of it out to the file and out of memory (msync MS_INVALIDATE), makes the no-copy buffer (nvn_mtl.m mtl_pool_add), fills it with the
-// GPU and reads it back with the CPU and, for the crossing pool, with pread in each file, commits it in a residency set (pool_res; macOS 15 or later), remaps the pool copy FALSE and makes
+// GPU and reads it back with the CPU and, for the crossing pool, with pread in each file, commits it in a residency set and fills it through a queue holding the set (pool_res; macOS 15 or later), remaps the pool copy FALSE and makes
 // a no-copy buffer over the remapped run with a GPU fill through it (hle_nvn.c vpool_map, vrun_set), and makes a buffer with two read-only pages at its middle (nvn_dirty.c). The VM
 // regions over each range are printed as mtl_pool_add's failure dump prints them.
 //
@@ -34,13 +34,14 @@ static void regions(const char *what, uintptr_t a, uintptr_t b) {   // the VM re
         r += rs;
     }
 }
-// A GPU fill of the whole buffer, then the CPU reads it back through p
-static int gpu_fill(id<MTLDevice> dev, id<MTLBuffer> b, const uint8_t *p, size_t len, uint8_t v) {
-    id<MTLCommandQueue> q = [dev newCommandQueue]; id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+// A GPU fill of the whole buffer through queue q, then the CPU reads it back through p
+static int gpu_fill_q(id<MTLCommandQueue> q, id<MTLBuffer> b, const uint8_t *p, size_t len, uint8_t v) {
+    id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
     [bl fillBuffer:b range:NSMakeRange(0, len) value:v]; [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
     size_t bad = 0; for (size_t i = 0; i < len; i++) bad += p[i] != v;
     return cb.status == MTLCommandBufferStatusCompleted && !bad;
 }
+static int gpu_fill(id<MTLDevice> dev, id<MTLBuffer> b, const uint8_t *p, size_t len, uint8_t v) { return gpu_fill_q([dev newCommandQueue], b, p, len, v); }
 static id<MTLBuffer> nocopy(id<MTLDevice> dev, void *p, size_t len, double *t) {
     double t0 = ms(); id<MTLBuffer> b = [dev newBufferWithBytesNoCopy:p length:len options:MTLResourceStorageModeShared deallocator:nil]; *t = ms() - t0; return b;
 }
@@ -72,10 +73,14 @@ int main(int argc, char **argv) { @autoreleasepool {
             uint8_t x0 = 0, x1 = 0; msync(p, len, MS_SYNC); pread(fd[0], &x0, 1, (off_t)(chunk - len / 2)); pread(fd[1], &x1, 1, (off_t)(len / 2 - 1));
             printf("file 0 at its end reads %#x, file 1 at the boundary's far side %#x: %s\n", x0, x1, x0 == 0xa7 && x1 == 0xa7 ? "ok" : "FAIL");
         }
-        if (@available(macOS 15.0, iOS 18.0, *)) {   // pool_res: into a residency set, committed on the spot (on iOS that wires the pool)
+        if (@available(macOS 15.0, iOS 18.0, *)) {   // pool_res: into a residency set, committed on the spot (on iOS that wires the pool), then a GPU fill through a queue holding the set
             NSError *err = nil; id<MTLResidencySet> rs = [dev newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&err];
             double t0 = ms(); [rs addAllocation:b]; [rs commit]; [rs requestResidency]; double t1 = ms();
-            printf("residency set %s: %.2f ms %s\n", what, t1 - t0, rs ? "ok" : "FAIL");
+            NSUInteger na = rs ? rs.allocationCount : 0; int filled = 0;   // commit and requestResidency report nothing: the set's count and a GPU pass through it are the verdict
+            if (rs) { id<MTLCommandQueue> q = [dev newCommandQueue]; [q addResidencySet:rs]; filled = gpu_fill_q(q, b, p, len, 0x5e); [q removeResidencySet:rs]; [rs endResidency]; }
+            printf("residency set %s: %s, %lu allocation(s) committed in %.2f ms, a GPU fill through a queue holding it, read by the CPU: %s %s\n", what, rs ? "made" : "not made",
+                   (unsigned long)na, t1 - t0, filled ? "done" : "failed", rs && na == 1 && filled ? "ok" : "FAIL");
+            if (!rs) printf("  %s\n", err ? err.localizedDescription.UTF8String : "no error given");
         }
         // vpool_map: a virtual pool's run is this pool's pages remapped copy FALSE elsewhere, then a no-copy buffer over the remapped run (vrun_set → mtl_pool_add)
         vm_address_t al = 0; vm_prot_t cur = 0, max = 0;   // vm_remap as hle_nvn.c calls it (the iOS SDK has no mach_vm.h)
