@@ -1,0 +1,29 @@
+# The iPhone app's switches for Mario Kart World 1.0.0 (switch2ios fork, on nxnative main). switch2ios/build_ipa.sh packs them into the app as dm/env.txt
+# (build_ipa_from_nsp.py --env-file); switch2ios/mac_run.py --phone uses them on the Mac, to try the phone's settings there first. On the phone, Documents/env.txt
+# overrides any of them with no rebuild (one KEY=VALUE per line, # starts a comment). What each one does: docs/env_switches.tsv; the measurements: switch2ios/README.md.
+#
+# Handheld mode: the game draws 1080p, as on a Switch 2 in the hand, with less memory than console mode (the profile's default). Never 720p
+DM_OPMODE=0
+# The guest's memory in files (hle_svc.c), out of the footprint iOS ends the app at; the kernel writes its pages out when it needs the room. Fork, iPhone: 90 s without it,
+# a 14-minute session with it (peak 5,663 MB of the 6,143 MiB limit); Mac: footprint peak 5.6 GiB instead of 11.6. Main (865cc35f) turns it on by itself on the phone for this
+# game, in 1 GB files; the line is for the Mac (mac_run.py --phone), where it is off by default
+DM_GUEST_FILE=1
+# MapPhysicalMemory limited to the application pool, as on the console: the SDK then gives back the pages it keeps mapped (fork: the alias region stayed at 1.25 GB instead of
+# growing to 2.25 GB over four races; 5.54 GB instead of 6.17 after 8 minutes on the main menu on the Mac)
+DM_MEM_MAP_LIMIT=1
+# Texture views: a texture that keeps replacing its 4 cached views gets more places, up to 64. On the menus the cache reused no view and malloc grew about 300 MB on the phone
+DM_NVN_VC_WAYS=64
+# Memory statistics every second (memstat.m): Documents/memstat.tsv on the phone, read with switch2ios/tools/memstat.py
+DM_MEMSTAT=memstat.tsv
+# memstat's region walk took about 270 ms a sample with 20 guest files: while samples take over 5 ms it runs every 10 samples, the rest every second
+DM_MEMSTAT_WALK_EVERY=10
+# Pipeline warm-up on (the default), as in the fork since its test 6 (4 Nov): with DM_MEM_MAP_LIMIT the phone's peak was 5,404 MiB, 828 MiB under the limit, and 78 % of the
+# slow frames were pipelines built while the game played; the warm-up costs about 214 MiB at the peak and about 70 s at the first start after an install (Metal's cache is empty).
+# Here the profile's seed list is still empty (nxnative's pso_manifest.tsv is provisional, and the fork's recorded list does not carry over: none of its 5,373 shader keys is in
+# this shader map), so the start builds what this phone recorded in its earlier runs (pso_user.tsv) and the first session builds its pipelines in play. To try next: a list
+# recorded on the Mac (DM_PSO_MANIFEST=off DM_PSO_RECORD), and a pipeline archive (build_ipa_from_nsp.py --gpu). DM_PSO_MANIFEST=off in Documents/env.txt turns it off
+# DM_PSO_MANIFEST=off
+#
+# Not carried over from the fork, because nxnative main does this by default: DM_NVN_DESWZ_GPU=2 and DM_NVN_SPARSE_RT / SPARSE_FREE / SPARSE_SHARE=1 (here large pools are wired
+# only as far as lookups reach, DM_NVN_POOL_CHUNKS, and large sparse textures are placement sparse textures with only their mapped tiles backed, shared by physical page,
+# DM_NVN_SPARSE_TILES); DM_VA_PROBE (not ported: a log line only).
