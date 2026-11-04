@@ -214,6 +214,8 @@ DM_NVN_VBUF_CACHE	switch	`0` turns off the cache of resolved vertex stream addre
 DM_NVN_VCONV_CHECK	diagnostic	`=1` scans the indices again at every reuse of a cached vertex conversion range (`vconv_range`) and reports differences
 DM_NVN_VCONV_CPU	switch	`=1` converts integer vertex inputs fed formats of another class on the CPU, as before, instead of through the shader's shadow inputs (`<key>_bv`)
 DM_NVN_VCONV_RANGE	switch	`0` / `1` overrides the profile's `vconv_range`: CPU vertex conversion only over the vertices each draw reads instead of the whole bound range
+DM_NVN_VC_MAX	switch	`=<n>` (64 to 1048576): how many textures may hold cached texture views (`vc_get`, default 16384); past it the cache is emptied
+DM_NVN_VC_WAYS	switch	`=<n>` (4 to 256; default 4): a texture that keeps replacing its cached texture views gets more places for them, doubling up to n (Mario Kart World's menus made a view again on nearly every lookup with 4)
 DM_NVN_VLOG	diagnostic	Set: logs each NVN memory pool as it is created (address, memory, size, flags) with a backtrace
 DM_NVN_VSDUMP	path	Output file for post-vertex captures; used with DM_NVN_VSDUMP_KEY and the frame/count bounds
 DM_NVN_VSDUMP_FROM	diagnostic	First presented frame eligible for a post-vertex capture (default 0)
