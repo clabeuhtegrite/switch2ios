@@ -10,13 +10,14 @@ sample (the region walk left out with DM_MEMSTAT_WALK_EVERY, no guest file), whi
 host wrote (memstat_note): the marks are listed with the time of the row after them, and each one starts a section, for which the disk writes, the page-ins and the system's
 page-outs are given per second. A flush is the guest file's dirty pages falling by 64 MiB or more within 2 s: the system writing them back to the file, or pages the host punched out of it (DM_GUEST_FILE_PUNCH).
 
-  tools/memstat.py [file] [--from S] [--to S] [--budget SIZE] [--every S] [--sections RE]
+  tools/memstat.py [file] [--from S] [--to S] [--budget SIZE] [--every S] [--sections RE] [--session FILE]
 
   file           default: the newest work/logs/memstat-*.tsv
   --from, --to   only these seconds (a part of the route, from the times in the run's log)
   --budget       the footprint a phone allows (default 5.5G, docs/ios.md): how long the run spent above it
   --every        the timeline's step in seconds (default 30): the highest footprint in each step, with its guest, gpu and malloc charge and Metal's allocations
   --sections     only the marks this regular expression finds start a section (default: every mark)
+  --session      a session file of tools/phone_session.py (work/logs/phone-session-*.tsv): its steps and marks become marks at their seconds, so each step starts a section
 """
 import argparse, re, statistics, sys
 from pathlib import Path
@@ -94,6 +95,7 @@ def main():
     ap.add_argument('--budget', default='5.5G')
     ap.add_argument('--every', type=float, default=30)
     ap.add_argument('--sections', type=regex)
+    ap.add_argument('--session')
     a = ap.parse_args()
     path = a.file
     if not path:
@@ -101,6 +103,14 @@ def main():
         if not files: sys.exit('no work/logs/memstat-*.tsv: run ./switch2mac.py run --phone first, or name the file')
         path = files[-1]
     every_row, marks, note = load(path)
+    if a.session:   # tools/phone_session.py: seconds since the launch, the Mac's clock, the kind, the text; each one a mark before the first row at or after its seconds
+        for line in Path(a.session).read_text(errors='replace').splitlines():
+            f = line.split('\t')
+            if len(f) < 4 or line.startswith('#') or f[0] == 'seconds': continue
+            try: ts = float(f[0])
+            except ValueError: continue
+            marks.append((next((i for i, r in enumerate(every_row) if r['seconds'] >= ts), len(every_row)), f'{f[2]}: {f[3]}'))
+        marks.sort(key=lambda m: m[0])
     win = [i for i, r in enumerate(every_row) if a.t0 <= r['seconds'] <= a.t1]
     rows = [every_row[i] for i in win]
     if not rows: sys.exit(f'{path}: no samples in that window')
@@ -179,13 +189,20 @@ def main():
             if i < len(rows) and (not a.sections or a.sections.search(text)): starts.setdefault(max(i, 0), []).append(text)
         bounds = sorted(set([0] + list(starts)))
         secs = [(b, (bounds[n + 1] if n + 1 < len(bounds) else len(rows)) - 1, ' | '.join(starts.get(b, ['(start)']))) for n, b in enumerate(bounds)]
-        print(f'\nper second in each section, a section starting at each mark{" the --sections expression finds" if a.sections else ""}: what the process wrote to disk, its page-ins, the whole system\'s page-outs')
-        print(f'{"from":>6}{"to":>7}{"written MiB/s":>15}{"page-ins/s":>12}{"page-outs/s":>13}{"(MiB/s)":>10}  section')
+        print(f'\nper second in each section, a section starting at each mark{" the --sections expression finds" if a.sections else ""}: what the process wrote to disk, its page-ins, the whole system\'s page-outs;'
+              ' then the footprint\'s peak in the section and how much the malloc charge moved across it (MiB)')
+        print(f'{"from":>6}{"to":>7}{"written MiB/s":>15}{"page-ins/s":>12}{"page-outs/s":>13}{"(MiB/s)":>10}{"peak":>7}{"malloc":>8}  section')
+        def peak(i0, i1):
+            v = [rows[k]['phys_footprint'] for k in range(i0, i1 + 1) if rows[k].get('phys_footprint') is not None]
+            return f'{max(v):>7.0f}' if v else f'{"-":>7}'
+        def dmalloc(b, i1):   # the malloc class's charged MiB, last row minus the row before the section
+            v = [rows[k]['malloc'][2] for k in range(b, i1 + 1) if rows[k].get('malloc')]
+            return f'{v[-1] - v[0]:>+8.0f}' if len(v) > 1 else f'{"-":>8}'
         for i0, i1, name in (secs if len(secs) > 1 else [])[:LIST_MAX] + [(0, len(rows) - 1, 'all')]:
             b = max(i0 - 1, 0)   # from the last row of the section before, so that the sections add up to the whole
             po = rate('host_pageouts', b, i1); pm = fmt(po * page / (1 << 20) if po is not None else None, 0, 2).strip()
             print(f'{rows[i0]["seconds"]:>6.0f}{rows[i1]["seconds"]:>7.0f}{fmt(rate("disk_written", b, i1), 15, 2)}{fmt(rate("pageins", b, i1), 12, 1)}{fmt(po, 13, 1)}'
-                  f'{"(" + pm + ")":>10}  {name[:60]}')
+                  f'{"(" + pm + ")":>10}{peak(i0, i1)}{dmalloc(b, i1)}  {name[:60]}')
         if len(secs) > LIST_MAX: print(f'  ... {len(secs) - LIST_MAX} more sections (--sections RE starts them at fewer marks)')
 
     if have('guest_dirty') and have('file_alloc'):
