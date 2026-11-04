@@ -389,20 +389,73 @@ static uintptr_t vm_run(uintptr_t a, int *readable) {
     if (r > a) { *readable = 0; return r; }
     *readable = (vi.protection & VM_PROT_READ) != 0; return r + rs;
 }
-// Copies n bytes from p into d, zero where p's pages were never written (anonymous, neither in memory nor paged out: mincore), so the copy does not bring those pages into the
-// process (on Darwin a read of one gets a page of its own), and zero where they cannot be read (vm_run): a texture's storage can reach pages with nothing mapped, past the data
-// its levels use (Mario Kart World: a 1.4 MB texture's, from 28 KB before its end), which the CPU deswizzle never reads; copying it whole stopped the host with SIGBUS.
-// → the bytes read; *unread: the bytes that could not be
-static uint64_t mem_copy_written(uint8_t *d, const uint8_t *p, uint64_t n, uint64_t *unread) {
-    uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n, run = 0; uint64_t r = 0; int rd = 0; *unread = 0;   // run: the end of the VM region the copy is in, readable or not (rd)
-    enum { CHUNK = 1024 }; char vec[CHUNK];
+// Holes of the guest file. With DM_GUEST_FILE=1 the guest block is mapped shared from a file (with DM_GUEST_FILE_CHUNK from several, each over its own part of the block from its offset 0: svc_guest_file_at, dm.h, gives the file that maps an address and the offset there), so no guest page is anonymous and the skip of pages never
+// written (anonymous, neither in memory nor paged out) no longer holds for any of them: every page was read, a page-in from the file for each one never written, render targets of
+// 128-256 MB included. A page the game writes stays in memory until the kernel writes it out, which gives it blocks in the file, so a guest page that is not in memory (mincore) and
+// whose bytes lie in a hole of its file (SEEK_DATA) reads as zeros: it was never written out, or it was given back (F_PUNCHHOLE). It counts as never written; a page written out and
+// freed since lies in data and is read, as is a page in memory. One SEEK_DATA (and a SEEK_HOLE in data) gives a whole extent, up to the end of its file's part of the block at most, kept for the pages after it; the callers drop it after
+// each mincore call, so that the file is always asked after mincore: a page written, written out and freed between the two would otherwise be taken for a hole. Without the file
+// (svc_guest_files 0), outside the block, or once the file cannot tell (a [RED] line), every page is read as before. DM_NVN_HOLE_CHECK=1 reads the pages taken for holes all
+// the same and logs any that holds data ([RED]), to check this on a Mac
+int svc_guest_files(void);   // hle_svc.c (dm.h): how many files hold the guest block, 0 while it is anonymous
+int svc_guest_file_at(uintptr_t a, off_t *off, uintptr_t *hi);   // hle_svc.c (dm.h): descriptor of the file that maps a, a's offset in that file, and the end of that file's range; -1 outside the block or while anonymous
+typedef struct { int on; uintptr_t lo, hi; int hole; } gf_ext;   // whether the guest lies in files that can tell, the extent [lo, hi) found last (never past the part of the block its file maps) and whether it is a hole
+static _Atomic int g_gf_off;   // the file could not tell once: not asked again
+static _Atomic uint64_t g_gf_asks, g_gf_ask_ns, g_gf_ask_max;   // extents asked, the time they took and the longest (the memory report)
+static void gf_ext_init(gf_ext *x) { *x = (gf_ext){ svc_guest_files() > 0 && !atomic_load_explicit(&g_gf_off, memory_order_relaxed), 0, 0, 0 }; }
+static int gf_hole(gf_ext *x, uintptr_t lo, uintptr_t hi) {   // whether [lo, hi) lies in one hole of the guest file that maps it (0: outside the block, no file, or data)
+    if (!x->on || lo >= hi) return 0;
+    if (lo < x->lo || lo >= x->hi) {
+        off_t o = 0; uintptr_t fe = 0; int fd = svc_guest_file_at(lo, &o, &fe);   // the file that maps lo, lo's offset in it and the end of its part of the block
+        if (fd < 0 || hi > fe) return 0;   // outside the block, or over two files (never a host page: the files are whole host pages)
+        uintptr_t fb = lo - (uintptr_t)o;   // where that file's part of the block starts
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        off_t size = (off_t)(fe - fb), d = lseek(fd, o, SEEK_DATA), h = -1; int err = errno;
+        if (d == o) h = lseek(fd, o, SEEK_HOLE);   // in data: up to the next hole, the end of the file at the latest
+        uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, m = atomic_load_explicit(&g_gf_ask_max, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_gf_asks, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_gf_ask_ns, dt, memory_order_relaxed);
+        while (dt > m && !atomic_compare_exchange_weak_explicit(&g_gf_ask_max, &m, dt, memory_order_relaxed, memory_order_relaxed)) {}
+        if (dt > 4000000) { static _Atomic uint64_t nslow; uint64_t k = atomic_fetch_add(&nslow, 1) + 1;   // an ask that waited on the file stalls the submit thread: said in the log, in the frame it falls in, not only in texmem
+            if (k <= 4 || !(k & (k - 1))) MLOG("[RED] [mem] guest file: finding the extent at %#llx took %.1f ms on this thread (%llu such asks so far; the totals are in texmem)", (unsigned long long)o, dt / 1e6, (unsigned long long)k); }
+        x->lo = lo;
+        if (d > o) { x->hi = fb + (uintptr_t)MIN(d, size); x->hole = 1; }   // a hole up to the next data
+        else if (d < 0 && err == ENXIO) { x->hi = fe; x->hole = 1; }   // no data from o on: a hole to the end of this file
+        else if (d == o) { x->hi = h > o ? fb + (uintptr_t)MIN(h, size) : hi; x->hole = 0; }
+        else {   // an error, or an answer before o: the file cannot tell, and its pages are read
+            if (!atomic_exchange(&g_gf_off, 1)) MLOG("[RED] [mem] guest file: SEEK_DATA at %#llx of the file that maps %#lx gave %lld (errno %d): storage checks and deswizzle copies read its pages never written out, as before",
+                                                     (unsigned long long)o, (unsigned long)lo, (long long)d, d < 0 ? err : 0);
+            x->on = 0; return 0;
+        }
+    }
+    return x->hole && hi <= x->hi;
+}
+static int mem_any_plain(const uint8_t *p, uint64_t n);
+// DM_NVN_HOLE_CHECK=1: a page taken for a hole of the guest file is read all the same (a page-in), and one that holds data is logged ([RED]) → 1: it holds data, the caller reads it
+static int gf_hole_check(uintptr_t lo, uintptr_t hi) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_HOLE_CHECK"); on = e && atoi(e) > 0; }
+    if (!on || !mem_any_plain((const uint8_t *)lo, hi - lo)) return 0;
+    static _Atomic uint64_t n; uint64_t k = atomic_fetch_add(&n, 1) + 1;
+    if (k <= 16 || !(k & (k - 1))) MLOG("[RED] [mem] guest file: %#lx+%#lx was not in memory and lay in a hole of the file, but holds data (DM_NVN_HOLE_CHECK, %llu so far)",
+                                        (unsigned long)lo, (unsigned long)(hi - lo), (unsigned long long)k);
+    return 1;
+}
+// Copies n bytes from p into d, zero where p's pages were never written (anonymous, neither in memory nor paged out: mincore; or a guest page not in memory in a hole of the guest
+// file: gf_hole), so the copy does not bring those pages into the process (on Darwin a read of one gets a page of its own, and the guest file's is read in from the file), and zero
+// where they cannot be read (vm_run): a texture's storage can reach pages with nothing mapped, past the data its levels use (Mario Kart World: a 1.4 MB texture's, from 28 KB before
+// its end), which the CPU deswizzle never reads; copying it whole stopped the host with SIGBUS.
+// → the bytes read; *unread: the bytes that could not be; *holes: the bytes taken for holes of the guest file
+static uint64_t mem_copy_written(uint8_t *d, const uint8_t *p, uint64_t n, uint64_t *unread, uint64_t *holes) {
+    uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n, run = 0; uint64_t r = 0; int rd = 0; *unread = *holes = 0;   // run: the end of the VM region the copy is in, readable or not (rd)
+    enum { CHUNK = 1024 }; char vec[CHUNK]; gf_ext gx; gf_ext_init(&gx);
     for (uintptr_t a = s & ~(pg - 1); n && a < e; a += CHUNK * pg) {
         uintptr_t b = MIN(a + CHUNK * pg, (e + pg - 1) & ~(pg - 1)); int ok = !mincore((void *)a, b - a, vec);
+        gx.lo = gx.hi = 0;   // the file is asked again after this mincore (gf_hole)
         for (size_t j = 0; j < (b - a) / pg; j++) {
             uintptr_t lo = MAX(a + j * pg, s), hi = MIN(a + (j + 1) * pg, e);
             if (a + j * pg >= run) run = vm_run(a + j * pg, &rd);
             if (!rd) { memset(d + (lo - s), 0, hi - lo); *unread += hi - lo; }
             else if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && (vec[j] & MINCORE_ANONYMOUS)) memset(d + (lo - s), 0, hi - lo);
+            else if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && gf_hole(&gx, lo, hi) && !gf_hole_check(lo, hi)) { memset(d + (lo - s), 0, hi - lo); *holes += hi - lo; }
             else { memcpy(d + (lo - s), (const void *)lo, hi - lo); r += hi - lo; }
         }
     }
@@ -455,6 +508,9 @@ static void udc_selftest(void) {
         MLOG("UDC self-check %s %s %lux%lu first value %08x, values differing from it %lu / %lu", g_dev.name.UTF8String, depth ? "Depth32F_S8" : "RGBA8", (unsigned long)w, (unsigned long)h, px[0], (unsigned long)bad, (unsigned long)(w * h));
     }
 }
+typedef int (*dm_punch_veto_fn)(uintptr_t lo, uintptr_t hi);   // hle_svc.c (dm.h): non-zero: do not punch [lo, hi)
+void dm_guest_punch_veto_register(dm_punch_veto_fn fn);
+static int punch_veto(uintptr_t lo, uintptr_t hi);   // the guest file's punches spare the pages Metal wraps (with the memory pools below)
 void mtl_init(void) {
     if (g_dev) return;
     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
@@ -467,6 +523,7 @@ void mtl_init(void) {
     if (!g_dev) MDIE("no Metal device");
     if (!g_dev.hasUnifiedMemory) MDIE("needs a unified-memory device (zero-copy memory pools)");
     g_q = [g_dev newCommandQueue];
+    { static _Atomic int once; if (!atomic_exchange(&once, 1)) dm_guest_punch_veto_register(punch_veto); }   // once, before any pool exists (mtl_pool_add calls mtl_init first), for the classic part below too
     // A device without Metal 4 (the paravirtualized GPU of a virtual Mac, such as GitHub's macos-26 runner: no residency set, no MTL4CommandQueue) cannot run the NVN layer. The GL and
     // Vulkan layers draw on classic queues of their own and need only the device (mtl_device_classic): there the classic part starts and presents are dropped, which is all a
     // run-time shader capture needs (the NSP script's capture_shaders boots headless; GitHub issue #112: Balatro's capture aborted here)
@@ -613,6 +670,9 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init(); g_reg_gen++;
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
+    { off_t fo; uintptr_t fe; static _Atomic int nspan;   // DM_GUEST_FILE_CHUNK: a pool over more than one guest file gets one zero-copy buffer over several file objects (the first 8 are logged)
+      if (svc_guest_files() > 1 && svc_guest_file_at(a, &fo, &fe) >= 0 && b > fe && atomic_fetch_add(&nspan, 1) < 8)
+          MLOG("[mem] memory pool %p+%#llx spans more than one guest file (DM_GUEST_FILE_CHUNK): its zero-copy buffer covers them, the first from its offset %#llx", mem, (unsigned long long)size, (unsigned long long)fo); }
     grw_release(a, b);
     uint64_t before = size >= (64u << 20) ? mem_charged((void *)a, b - a) + 1 : 0;   // a large pool: what of it the game has written, before and after its zero-copy buffer ([mem] line below)
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
@@ -659,6 +719,27 @@ void mtl_pool_del(const void *mem) {
     }
     pthread_mutex_unlock(&g_mu);
 }
+
+// The guest file's punches (hle_svc.c: with DM_GUEST_FILE=1 and the host's hole punching on, off by default, memory the game gives back, by UnmapPhysicalMemory among others, leaves the file with F_PUNCHHOLE, its pages and its blocks)
+// ask this first, with g_map_lock held: no punch under a memory pool's zero-copy buffer, which wraps the pool's whole host pages for the GPU (on iOS a resident one wires them), whether
+// the pool is registered or finalized with its buffer still alive (deferred release, a texture made on the buffer: g_dead_pools), nor under the physical pages a virtual pool's runs map
+// (nvn_vpool_src_covers). A virtual pool's run buffer wraps the pool's own range, not guest addresses: once its run is unmapped, a buffer of it still alive is not matched here, and nvn_vpool_src_covers knows only live runs. g_mu is only tried, and the punch refused while it is held. No path holding g_mu takes g_map_lock or makes a memory SVC (they keep the pool table, commit
+// residency, make arenas, wait for fences, write the memory report; none runs guest code), so even waiting for it could not deadlock; but it would hold the SVC, and g_map_lock with it,
+// behind a residency commit or a fence. The virtual pools are asked after g_mu is let go: their lock is taken before g_mu (vrun_set → mtl_pool_add), never after
+int nvn_vpool_src_covers(uintptr_t lo, uintptr_t hi);   // hle_nvn.c: non-zero if a live virtual-pool run maps guest pages in [lo, hi), or if it cannot tell without blocking
+static _Atomic uint64_t g_punch_asked, g_punch_no[4];   // punches asked about; refused over a pool, over a finalized pool's live buffer, over a virtual pool's pages or with its lock busy (nvn_vpool_src_covers cannot tell), with g_mu busy (the memory report)
+static int punch_veto(uintptr_t lo, uintptr_t hi) { @autoreleasepool {
+    atomic_fetch_add_explicit(&g_punch_asked, 1, memory_order_relaxed);
+    if (pthread_mutex_trylock(&g_mu)) { atomic_fetch_add_explicit(&g_punch_no[3], 1, memory_order_relaxed); return 1; }
+    uintptr_t pg = vm_page_size; int why = -1;
+    for (int i = 0; i < g_npool && why < 0; i++) if (g_pools[i].base < hi && lo < ((g_pools[i].hi + pg - 1) & ~(pg - 1))) why = 0;   // the buffer's pages, from base to hi rounded up
+    if (why < 0 && g_dead_pools.count)
+        for (id<MTLBuffer> b in g_dead_pools) if ((uintptr_t)b.contents < hi && lo < (uintptr_t)b.contents + b.length) { why = 1; break; }
+    pthread_mutex_unlock(&g_mu);
+    if (why < 0 && nvn_vpool_src_covers(lo, hi)) why = 2;
+    if (why >= 0) atomic_fetch_add_explicit(&g_punch_no[why], 1, memory_order_relaxed);
+    return why >= 0;
+} }
 
 // Address → pool: the last hit first, then a binary search over indices sorted by start address, and a full linear scan only when that fails (pools overlapping).
 // The Legend of Zelda: Breath of the Wild keeps about 1760 memory pools alive and every buffer binding of every draw looks one up; the old full scan took about 4% of the submit thread's samples (mtl_gpu_addr 222 / 6 s). Adding / removing pools invalidates the index, which is re-sorted when next used. Caller holds g_mu
@@ -2975,16 +3056,16 @@ static void srt_touch(const tex_t *t, id o) {
     pthread_mutex_lock(&g_srt_mu); srt_sync(e, o); pthread_mutex_unlock(&g_srt_mu);
 }
 // DM_NVN_DESWZ_GPU=2 (mtl_init): a copy of a texture's storage for the GPU deswizzle. The open upload batch keeps it, and lets it go and takes it out of the residency set when the
-// batch completes; it counts as the batch's staging, so many uploads still split into batches as before. Never-written pages and pages that cannot be read are copied as zeros,
-// unread (mem_copy_written)
-static _Atomic uint64_t g_deswz_staged_n, g_deswz_staged_bytes, g_deswz_staged_read, g_deswz_staged_unread;
+// batch completes; it counts as the batch's staging, so many uploads still split into batches as before. Never-written pages (holes of the guest file among them) and pages that
+// cannot be read are copied as zeros, unread (mem_copy_written)
+static _Atomic uint64_t g_deswz_staged_n, g_deswz_staged_bytes, g_deswz_staged_read, g_deswz_staged_unread, g_deswz_staged_hole;
 static id<MTLBuffer> deswz_stage(const tex_t *t) {
     NSUInteger n = (NSUInteger)((t->L.size + 0xFFFF) & ~0xFFFFull) + 0x10000;   // and 64 KB more of zeros: the pool's buffer had bytes past the storage's end, in case a deswizzle reads there
     id<MTLBuffer> b = [g_dev newBufferWithLength:n options:MTLResourceStorageModeShared];
     if (!b) MDIE("deswizzle copy of %llu bytes failed", (unsigned long long)t->L.size);
-    uint8_t *c = b.contents; uint64_t u, r = mem_copy_written(c, t->mem, t->L.size, &u); memset(c + t->L.size, 0, n - t->L.size);
+    uint8_t *c = b.contents; uint64_t u, h, r = mem_copy_written(c, t->mem, t->L.size, &u, &h); memset(c + t->L.size, 0, n - t->L.size);
     res_add(b); [g_up_keep addObject:b]; g_up_staging_bytes += n;
-    atomic_fetch_add(&g_deswz_staged_n, 1); atomic_fetch_add(&g_deswz_staged_bytes, t->L.size); atomic_fetch_add(&g_deswz_staged_read, r);
+    atomic_fetch_add(&g_deswz_staged_n, 1); atomic_fetch_add(&g_deswz_staged_bytes, t->L.size); atomic_fetch_add(&g_deswz_staged_read, r); atomic_fetch_add(&g_deswz_staged_hole, h);
     if (u && !atomic_fetch_add(&g_deswz_staged_unread, u))
         MLOG("[mem] deswizzle copy: texture ser=%llu %ux%u format %#x, storage %p+%#llx: %llu KB of it cannot be read, copied as zeros (the total is in texmem)", (unsigned long long)t->serial,
              t->d.width, t->d.height, t->d.format, (void *)t->mem, (unsigned long long)t->L.size, (unsigned long long)(u >> 10));
@@ -3183,11 +3264,12 @@ int nvn_flushed(const void *p, uint64_t n);   // hle_nvn.c
 // Pages never written are skipped, not read: anonymous memory that is neither in memory nor paged out (mincore) has not been written since it was mapped and reads as zeros, and
 // reading it to find that out makes the kernel give it a page (Darwin has no shared zero page; a read fault fills a new page with zeros), charged to the process from then on, on
 // iOS too, where the compressor keeps even a page of zeros in the footprint. mem_any is asked about a texture's whole storage at its first use (tex_init_fill, tex_cpu_content,
-// tex_tracked_content), large render targets included (Mario Kart World: 128-256 MB each). A file's page, or a range mincore cannot report, is read as before.
+// tex_tracked_content), large render targets included (Mario Kart World: 128-256 MB each). A file's page is read as before, unless it is a guest page not in memory that lies in a
+// hole of the guest file (DM_GUEST_FILE=1: gf_hole), which counts as never written too, apart (g_mem_any_hole); a range mincore cannot report is read as before.
 // A page that cannot be read (vm_run: PROT_NONE, as the game's unmapped memory and its heap past SetHeapSize are, or nothing mapped) counts as zeros without being read, as in mem_copy_written:
 // the skip above kept such pages from being read only while they were anonymous and never written, and with the guest in a file (DM_GUEST_FILE=1) no guest page is anonymous, so a storage
-// reaching one would stop the host with SIGBUS. DM_NVN_MEMANY_MINCORE=0 reads every page that can be read
-static _Atomic uint64_t g_mem_any_read, g_mem_any_skip, g_mem_any_unread;   // bytes read, skipped as never written, not read as unreadable (the large-texture [mem] lines, the memory report)
+// reaching one would stop the host with SIGBUS; it is asked first. DM_NVN_MEMANY_MINCORE=0 reads every page that can be read, the guest file's holes included
+static _Atomic uint64_t g_mem_any_read, g_mem_any_skip, g_mem_any_unread, g_mem_any_hole;   // bytes read, skipped as never written, not read as unreadable, skipped as holes of the guest file (the large-texture [mem] lines, the memory report)
 static int mem_any_plain(const uint8_t *p, uint64_t n) {
     uint64_t i = 0, v;
     for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); if (v) return 1; }
@@ -3198,14 +3280,17 @@ static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-
     static int mc = -1; if (mc < 0) { const char *e = getenv("DM_NVN_MEMANY_MINCORE"); mc = !e || atoi(e) != 0; }
     uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n, run = 0; int rd = 0;   // run: the end of the VM region the page is in, readable or not (rd)
     enum { CHUNK = 1024 }; char vec[CHUNK];   // pages per mincore call
+    gf_ext gx; gf_ext_init(&gx);   // the guest file's holes (gf_hole)
     for (uintptr_t a = s & ~(pg - 1); n && a < e; a += CHUNK * pg) {
         uintptr_t b = MIN(a + CHUNK * pg, (e + pg - 1) & ~(pg - 1));
         int ok = mc && n >= 4 * pg && !mincore((void *)a, b - a, vec);   // a storage under 4 pages is read without asking
+        gx.lo = gx.hi = 0;   // the file is asked again after this mincore (gf_hole)
         for (size_t j = 0; j < (b - a) / pg; j++) {
             uintptr_t lo = MAX(a + j * pg, s), hi = MIN(a + (j + 1) * pg, e);
             if (a + j * pg >= run) run = vm_run(a + j * pg, &rd);
             if (!rd) { atomic_fetch_add_explicit(&g_mem_any_unread, hi - lo, memory_order_relaxed); continue; }
             if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && (vec[j] & MINCORE_ANONYMOUS)) { atomic_fetch_add_explicit(&g_mem_any_skip, hi - lo, memory_order_relaxed); continue; }
+            if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && gf_hole(&gx, lo, hi) && !gf_hole_check(lo, hi)) { atomic_fetch_add_explicit(&g_mem_any_hole, hi - lo, memory_order_relaxed); continue; }
             atomic_fetch_add_explicit(&g_mem_any_read, hi - lo, memory_order_relaxed);
             if (mem_any_plain((const uint8_t *)lo, hi - lo)) return 1;
         }
@@ -3351,10 +3436,10 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) { AP_B; id<MTLTexture> r = tex_mt
 static void big_tex_log(const tex_t *t, id<MTLTexture> mt, const char *how, uint64_t before) {
     static int n; if (n++ >= 48) return;
     MLOG("[mem] large texture ser=%llu %ux%ux%u format %#x target %d levels %u flags %#x, pool %p flags %#x: storage %p (pool offset %#llx) %llu MB (%llu MB of it in memory before, %llu MB after), Metal %llu MB, %s; "
-         "storage checks so far %llu MB read, %llu MB skipped as never written, %llu MB unreadable", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
+         "storage checks so far %llu MB read, %llu MB skipped as never written, %llu MB as holes of the guest file, %llu MB unreadable", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
          t->d.flags, (const void *)t->pool, t->pool ? t->pool->flags : 0, (const void *)t->mem, (unsigned long long)t->off, (unsigned long long)(t->L.size >> 20), (unsigned long long)(before >> 20), (unsigned long long)(mem_charged(t->mem, t->L.size) >> 20),
          (unsigned long long)(mt ? mt.allocatedSize >> 20 : 0), how, (unsigned long long)(atomic_load(&g_mem_any_read) >> 20), (unsigned long long)(atomic_load(&g_mem_any_skip) >> 20),
-         (unsigned long long)(atomic_load(&g_mem_any_unread) >> 20));
+         (unsigned long long)(atomic_load(&g_mem_any_hole) >> 20), (unsigned long long)(atomic_load(&g_mem_any_unread) >> 20));
 }
 // A sparse texture is bound from its first level whose pages, and those of every smaller level, are all mapped: a view of levels [r, n) samples as with a minimum LOD of r.
 // The translator drops TEX's LOD clamp and residency predicate, so Monster Hunter Rise's streamed textures were sampled at levels it had not mapped yet; those read 0, which ASTC
@@ -13158,8 +13243,8 @@ void mtl_mem_textures(FILE *f) { @autoreleasepool {
     pthread_mutex_lock(&g_mu);
     for (int k = 0; k < PR_SITES && g_pr_site[k].n; k++) fprintf(f, "%d\t%llu\t%.1f\n", g_pr_site[k].line, (unsigned long long)g_pr_site[k].n, g_pr_site[k].bytes / 1048576.0);
     pthread_mutex_unlock(&g_mu);
-    fprintf(f, "\nstorage checks (mem_any)\t%.1f MiB read\t%.1f MiB skipped as never written\t%.1f MiB unreadable, taken as zeros\n", atomic_load(&g_mem_any_read) / 1048576.0,
-            atomic_load(&g_mem_any_skip) / 1048576.0, atomic_load(&g_mem_any_unread) / 1048576.0);
+    fprintf(f, "\nstorage checks (mem_any)\t%.1f MiB read\t%.1f MiB skipped as never written\t%.1f MiB skipped as holes of the guest file\t%.1f MiB unreadable, taken as zeros\n",
+            atomic_load(&g_mem_any_read) / 1048576.0, atomic_load(&g_mem_any_skip) / 1048576.0, atomic_load(&g_mem_any_hole) / 1048576.0, atomic_load(&g_mem_any_unread) / 1048576.0);
     pthread_mutex_lock(&g_srt_mu);
     fprintf(f, "sparse render targets (DM_NVN_SPARSE_RT)\t%u made\t%llu Metal tiles\t%.1f MiB in %lu heaps\t%llu tile mappings made\t%llu taken off\n", atomic_load(&g_srt_n),
             (unsigned long long)g_srt_tiles, g_srt_tiles * (double)SPARSE_TILE / 1048576.0, (unsigned long)g_srt_heaps.count, (unsigned long long)g_srt_maps, (unsigned long long)g_srt_unmaps);
@@ -13196,8 +13281,16 @@ void mtl_mem_textures(FILE *f) { @autoreleasepool {
         }
         free(ph);
     }
-    fprintf(f, "deswizzle copies (DM_NVN_DESWZ_GPU=2)\t%llu\t%.1f MiB of storage\t%.1f MiB of it read\t%.1f MiB that cannot be read, as zeros\n", (unsigned long long)atomic_load(&g_deswz_staged_n),
-            atomic_load(&g_deswz_staged_bytes) / 1048576.0, atomic_load(&g_deswz_staged_read) / 1048576.0, atomic_load(&g_deswz_staged_unread) / 1048576.0);
+    fprintf(f, "deswizzle copies (DM_NVN_DESWZ_GPU=2)\t%llu\t%.1f MiB of storage\t%.1f MiB of it read\t%.1f MiB that cannot be read, as zeros\t%.1f MiB in holes of the guest file, as zeros\n",
+            (unsigned long long)atomic_load(&g_deswz_staged_n), atomic_load(&g_deswz_staged_bytes) / 1048576.0, atomic_load(&g_deswz_staged_read) / 1048576.0,
+            atomic_load(&g_deswz_staged_unread) / 1048576.0, atomic_load(&g_deswz_staged_hole) / 1048576.0);
+    if (svc_guest_files() > 0)   // the guest in a file (DM_GUEST_FILE=1): what finding its holes cost the storage checks and the deswizzle copies (gf_hole)
+        fprintf(f, "guest file holes (storage checks, deswizzle copies)\t%llu extents asked (SEEK_DATA, and SEEK_HOLE in data)\t%.1f ms in all\t%.3f ms the longest%s\n", (unsigned long long)atomic_load(&g_gf_asks),
+                atomic_load(&g_gf_ask_ns) / 1e6, atomic_load(&g_gf_ask_max) / 1e6, atomic_load(&g_gf_off) ? "\tthe file could not tell: no longer asked" : "");
+    if (atomic_load(&g_punch_asked))   // the guest file's punches (punch_veto)
+        fprintf(f, "guest file punches (memory given back)\t%llu asked about\t%llu refused over a memory pool\t%llu over a finalized pool's buffer still alive\t%llu over a virtual pool's pages or with its lock busy\t%llu with the pool table's lock busy\n",
+                (unsigned long long)atomic_load(&g_punch_asked), (unsigned long long)atomic_load(&g_punch_no[0]), (unsigned long long)atomic_load(&g_punch_no[1]),
+                (unsigned long long)atomic_load(&g_punch_no[2]), (unsigned long long)atomic_load(&g_punch_no[3]));
     free(pp); free(pb); free(pk);
 } }
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
