@@ -302,6 +302,8 @@ static size_t big_bss_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i+
 
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
 void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = g_reserve; }
+int svc_guest_files(void) { return g_gf_n; }   // how many files hold the guest block (DM_GUEST_FILE), 0 while it is anonymous
+int svc_guest_file_nth(int i) { return i >= 0 && i < g_gf_n ? g_gf_tab[i] : -1; }   // the descriptor of file i, -1 out of range; file 0's volume holds them all
 void svc_alias_range(uint8_t **base, size_t *size) { *base = g_alias; *size = g_alias_cap; }   // the alias region (GetInfo's), NULL before mem_init
 
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,

@@ -13,6 +13,8 @@ static int hid_usleep(useconds_t usec);
 #include "../pad_slots.h"
 void dm_oe_execute(int index, const void *param, size_t n) { (void)index; (void)param; (void)n; }   // DM_CTL "program", "webshot": not exercised here
 void front_web_shot(const char *path) { (void)path; }
+uint64_t g_t0_ns;                                     // DM_CTL "mark": not exercised here
+void memstat_note(const char *line) { (void)line; }
 
 static int checks, fails, g_mode = 1, g_signals;
 static void *g_signalled;
