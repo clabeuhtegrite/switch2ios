@@ -11091,7 +11091,12 @@ static void dispatch(const p_dispatch *dp) {
     }
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "compute shader lacks threadgroup size reflection"); return; }
-    if (cs->rf.nfirst && (dp->ind || (dp->x && dp->y && dp->z))) first_stores(cs);   // see first_stores (an empty direct dispatch runs no first invocation)
+    if (cs->rf.nfirst && (dp->ind || (dp->x && dp->y && dp->z))) {   // see first_stores (an empty direct dispatch runs no first invocation)
+        first_stores(cs);
+        // dmsh_first.py leaves out the rows a test does not tell apart (workgroup y or z): with such a test the console made the stores again as each row began, which would lose
+        // the earlier rows' entries there, so a dispatch more than one row deep is not expected; this says if one comes
+        if (!dp->ind && (dp->y > 1 || dp->z > 1)) RED_ONCE(926, "compute shader %s: first-invocation stores made once before %dx%dx%d workgroups; if its test leaves out workgroup y or z, the console made them again at each row", cs->key, dp->x, dp->y, dp->z);
+    }
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
     rp_end();
     image_prepare(prog_get(S.cprog), 0x20);
