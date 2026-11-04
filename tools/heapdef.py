@@ -2,7 +2,7 @@
 """Mario Kart World's heap definitions, read from your own dump, and copies with some heaps resized for a RomFS overlay.
 
 The game's heap sizes are in System/HeapSize/<variant>.HeapDef.byml.zs (Default, Product, PilotME, PilotME24GB, each also as .Nin_Ounce_NVN2): a BYML dictionary
-Heaps, heap name -> {Size: KB, Parent: heap name}, where a Size of -1 takes what its parent has left. `set` writes copies with new sizes into an overlay folder, which the
+Heaps, heap name -> {Size: KB, Parent: heap name}, where a Size of -1 takes what its parent has left (version 1.0.0 reads Default.Nin_Ounce_NVN2). `set` writes copies with new sizes into an overlay folder, which the
 host reads before the game's own RomFS when DM_ROMFS_OVERLAY names it (nxnative/dm/host/hle_fs.c). The copies are made from your dump and stay on your machine, in work/
 (out of git), like everything else built from it. Nothing here prints more than heap names and sizes.
 
