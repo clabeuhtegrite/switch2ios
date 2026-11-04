@@ -61,10 +61,11 @@ static size_t va_probe(void) {
 // it needs the room, which it cannot do with an iPhone app's anonymous pages. A page never written reads 0 as before, and mprotect (dirty tracking), vm_remap (virtual pools) and Metal's no-copy
 // buffers work on them as on anonymous pages. The file is sparse and unlinked at once, so it goes with the process, and lies in the user's temporary folder (on iOS NSTemporaryDirectory:
 // DM_GUEST_FILE_DIR, from main.m); the host never flushes it (no msync, no fsync). It takes disk space as pages are written out, at most what the game has touched. When it cannot be made or
-// mapped the guest stays in anonymous memory, with a line saying why. UnmapPhysicalMemory's MADV_FREE gives nothing back on these pages: what the game unmaps stays in the file (F_PUNCHHOLE would free it)
+// mapped the guest stays in anonymous memory, with a [RED] line saying why; [RED] lines also say what could go wrong with the file (not unlinked, not on a local APFS volume, not sparse, a
+// protection class that closes when the phone locks, under 10 GB free). UnmapPhysicalMemory's MADV_FREE gives nothing back on these pages: what the game unmaps stays in the file (F_PUNCHHOLE would free it)
 int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have
-// One line every 10 s: the file's blocks on disk, what the process wrote and dirtied (logical writes), the footprint's parts beside the file pages it has mapped (external: PROT_NONE takes pages out
-// of it, as out of internal), the room left on the disk
+// One line every 10 s, [RED] under 2 GB free: the file's blocks on disk, what the process wrote, read and dirtied (logical writes) and its page-ins (pages read back from the file among them), the
+// footprint's parts and its peak so far beside the file pages it has mapped (external: PROT_NONE takes pages out of it, as out of internal), the room left on the disk
 static void *guest_file_thread(void *arg) {
     int fd = (int)(intptr_t)arg; const double G = 1073741824.0;
     for (;;) {
@@ -73,37 +74,56 @@ static void *guest_file_thread(void *arg) {
         double blocks = fstat(fd, &st) ? -1 : st.st_blocks * 512.0 / G, avail = fstatfs(fd, &fs) ? -1 : (double)fs.f_bavail * fs.f_bsize / G;
         int ru_ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
-        LOG("[mem] guest file: %.2f GB allocated on disk; process wrote %.2f GB to disk, logical writes %.2f GB; footprint %.2f GB (internal %.2f, compressed %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk",
-            blocks, ru_ok ? ru.ri_diskio_byteswritten / G : -1, ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, vi.external / G, avail);
+        LOG("%s[mem] guest file: %.2f GB allocated on disk; process wrote %.2f GB to disk and read %.2f GB, %llu page-ins, logical writes %.2f GB; footprint %.2f GB (internal %.2f, compressed %.2f, peak so far %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk",
+            avail >= 0 && avail < 2 ? "[RED] " : "", blocks, ru_ok ? ru.ri_diskio_byteswritten / G : -1, ru_ok ? ru.ri_diskio_bytesread / G : -1, ru_ok ? (unsigned long long)ru.ri_pageins : 0ull,
+            ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, ru_ok ? ru.ri_lifetime_max_phys_footprint / G : -1, vi.external / G, avail);
     }
     return NULL;
 }
+// A new file of this process's own, never a link's target (O_EXCL, O_NOFOLLOW): one left by an earlier process with the same number is removed first
+static int guest_file_open(const char *path) {
+    const int fl = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC;
+    for (int i = 0;; i++) {
+#if TARGET_OS_IPHONE
+        // Protection class C (PROTECTION_CLASS_C, which the SDK's headers do not name), whose key stays from the first unlock until the phone restarts: in a class that closes when the phone locks,
+        // the file's pages could no longer be read (SIGBUS). It is also the class an app's files get by default, hence the plain open if this call fails
+        int fd = open_dprotected_np(path, fl, 3, 0, 0600);
+        if (fd < 0 && errno != EEXIST) fd = open(path, fl, 0600);
+#else
+        int fd = open(path, fl, 0600);
+#endif
+        if (fd >= 0 || errno != EEXIST || i) return fd;
+        unlink(path);
+    }
+}
 static void guest_file_init(void) {
     const char *e = getenv("DM_GUEST_FILE"); if (!e || atoi(e) <= 0) return;
-    char dir[1024] = "", path[1100]; const char *d = getenv("DM_GUEST_FILE_DIR");
+    const double G = 1073741824.0; char dir[1024] = "", path[1100]; const char *d = getenv("DM_GUEST_FILE_DIR");
     if (d && *d) snprintf(dir, sizeof dir, "%s", d);
-    else if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir)) { LOG("[mem] guest memory: anonymous (DM_GUEST_FILE: no temporary folder, errno %d)", errno); return; }
+    else if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: no temporary folder, errno %d)", errno); return; }
     snprintf(path, sizeof path, "%s%sguest-%d.mem", dir, dir[0] && dir[strlen(dir) - 1] == '/' ? "" : "/", (int)getpid());
-    int cls = -1;
+    int fd = guest_file_open(path), cls = -1;
+    if (fd < 0) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: cannot create %s, errno %d)", path, errno); return; }
+    if (unlink(path)) LOG("[RED] [mem] guest file: cannot unlink %s (errno %d): it will stay after the game exits, with what was written out to it", path, errno);
 #if TARGET_OS_IPHONE
-    // Protection class C (PROTECTION_CLASS_C, which the SDK's headers do not name), whose key stays from the first unlock until the phone restarts: in a class that closes when the phone locks,
-    // the file's pages could no longer be read (SIGBUS). It is also the class an app's files get by default, hence the plain open if this call fails
-    int fd = open_dprotected_np(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 3, 0, 0600);
-    if (fd < 0) fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd >= 0) cls = fcntl(fd, F_GETPROTECTIONCLASS);
-#else
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    cls = fcntl(fd, F_GETPROTECTIONCLASS);
 #endif
-    if (fd < 0) { LOG("[mem] guest memory: anonymous (DM_GUEST_FILE: cannot create %s, errno %d)", path, errno); return; }
-    unlink(path);
-    if (ftruncate(fd, (off_t)g_reserve)) { LOG("[mem] guest memory: anonymous (DM_GUEST_FILE: cannot size %s to %.2f GB, errno %d)", path, g_reserve / 1073741824.0, errno); close(fd); return; }
+    if (ftruncate(fd, (off_t)g_reserve)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: cannot size %s to %.2f GB, errno %d)", path, g_reserve / G, errno); close(fd); return; }
     if (mmap(g_as, g_reserve, PROT_NONE, MAP_SHARED | MAP_FIXED, fd, 0) != g_as) {
-        LOG("[mem] guest memory: anonymous (DM_GUEST_FILE: cannot map %s, errno %d)", path, errno); close(fd);
+        LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: cannot map %s, errno %d)", path, errno); close(fd);
         if (mmap(g_as, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) != g_as) die("reserve guest AS again after DM_GUEST_FILE (errno %d)", errno);   // whatever the failed call left there
         return;
     }
-    struct statfs fs; double avail = fstatfs(fd, &fs) ? -1 : (double)fs.f_bavail * fs.f_bsize / 1073741824.0;
-    LOG("[mem] guest memory: file %s (unlinked, sparse, shared), %.2f GB, protection class %d (-1 on a Mac), %.1f GB free on its disk", path, g_reserve / 1073741824.0, cls, avail);
+    struct stat st; struct statfs fs; int fs_ok = !fstatfs(fd, &fs);
+    double avail = fs_ok ? (double)fs.f_bavail * fs.f_bsize / G : -1, held = fstat(fd, &st) ? -1 : st.st_blocks * 512.0 / G;
+    LOG("[mem] guest memory: file %s (unlinked, sparse, shared), %.2f GB, %.2f GB of it on disk, on a%s %s volume, protection class %d (-1 on a Mac), %.1f GB free on its disk", path, g_reserve / G, held,
+        fs_ok && (fs.f_flags & MNT_LOCAL) ? " local" : "", fs_ok ? fs.f_fstypename : "unknown", cls, avail);
+    if (!fs_ok || strcmp(fs.f_fstypename, "apfs") || !(fs.f_flags & MNT_LOCAL)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
+    if (held > 1.0 / 16) LOG("[RED] [mem] guest file: %.2f GB on disk as soon as it was sized: not sparse", held);
+#if TARGET_OS_IPHONE
+    if (cls != 3 && cls != 4) LOG("[RED] [mem] guest file: protection class %d, not C (3) or D (4): in a class that closes when the phone locks, its pages may not be read or written out while it is locked", cls);
+#endif
+    if (avail >= 0 && avail < 10) LOG("[RED] [mem] guest file: %.1f GB free on its disk, under 10: the file takes up to what the game has touched (Mario Kart World: 6 GB in 10 minutes on a Mac), and a full disk was not tried", avail);
     pthread_t th; if (!pthread_create(&th, NULL, guest_file_thread, (void *)(intptr_t)fd)) pthread_detach(th);
 }
 

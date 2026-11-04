@@ -3184,8 +3184,10 @@ int nvn_flushed(const void *p, uint64_t n);   // hle_nvn.c
 // reading it to find that out makes the kernel give it a page (Darwin has no shared zero page; a read fault fills a new page with zeros), charged to the process from then on, on
 // iOS too, where the compressor keeps even a page of zeros in the footprint. mem_any is asked about a texture's whole storage at its first use (tex_init_fill, tex_cpu_content,
 // tex_tracked_content), large render targets included (Mario Kart World: 128-256 MB each). A file's page, or a range mincore cannot report, is read as before.
-// DM_NVN_MEMANY_MINCORE=0 reads every page
-static _Atomic uint64_t g_mem_any_read, g_mem_any_skip;   // bytes read, bytes skipped as never written (the large-texture [mem] lines, the memory report)
+// A page that cannot be read (vm_run: PROT_NONE, as the game's unmapped memory and its heap past SetHeapSize are, or nothing mapped) counts as zeros without being read, as in mem_copy_written:
+// the skip above kept such pages from being read only while they were anonymous and never written, and with the guest in a file (DM_GUEST_FILE=1) no guest page is anonymous, so a storage
+// reaching one would stop the host with SIGBUS. DM_NVN_MEMANY_MINCORE=0 reads every page that can be read
+static _Atomic uint64_t g_mem_any_read, g_mem_any_skip, g_mem_any_unread;   // bytes read, skipped as never written, not read as unreadable (the large-texture [mem] lines, the memory report)
 static int mem_any_plain(const uint8_t *p, uint64_t n) {
     uint64_t i = 0, v;
     for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); if (v) return 1; }
@@ -3194,14 +3196,15 @@ static int mem_any_plain(const uint8_t *p, uint64_t n) {
 }
 static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-zero (stops at the first)
     static int mc = -1; if (mc < 0) { const char *e = getenv("DM_NVN_MEMANY_MINCORE"); mc = !e || atoi(e) != 0; }
-    uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n;
-    if (!mc || n < 4 * pg) { atomic_fetch_add_explicit(&g_mem_any_read, n, memory_order_relaxed); return mem_any_plain(p, n); }
+    uintptr_t pg = vm_page_size, s = (uintptr_t)p, e = s + n, run = 0; int rd = 0;   // run: the end of the VM region the page is in, readable or not (rd)
     enum { CHUNK = 1024 }; char vec[CHUNK];   // pages per mincore call
-    for (uintptr_t a = s & ~(pg - 1); a < e; a += CHUNK * pg) {
+    for (uintptr_t a = s & ~(pg - 1); n && a < e; a += CHUNK * pg) {
         uintptr_t b = MIN(a + CHUNK * pg, (e + pg - 1) & ~(pg - 1));
-        int ok = !mincore((void *)a, b - a, vec);
+        int ok = mc && n >= 4 * pg && !mincore((void *)a, b - a, vec);   // a storage under 4 pages is read without asking
         for (size_t j = 0; j < (b - a) / pg; j++) {
             uintptr_t lo = MAX(a + j * pg, s), hi = MIN(a + (j + 1) * pg, e);
+            if (a + j * pg >= run) run = vm_run(a + j * pg, &rd);
+            if (!rd) { atomic_fetch_add_explicit(&g_mem_any_unread, hi - lo, memory_order_relaxed); continue; }
             if (ok && !(vec[j] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) && (vec[j] & MINCORE_ANONYMOUS)) { atomic_fetch_add_explicit(&g_mem_any_skip, hi - lo, memory_order_relaxed); continue; }
             atomic_fetch_add_explicit(&g_mem_any_read, hi - lo, memory_order_relaxed);
             if (mem_any_plain((const uint8_t *)lo, hi - lo)) return 1;
@@ -3348,9 +3351,10 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) { AP_B; id<MTLTexture> r = tex_mt
 static void big_tex_log(const tex_t *t, id<MTLTexture> mt, const char *how, uint64_t before) {
     static int n; if (n++ >= 48) return;
     MLOG("[mem] large texture ser=%llu %ux%ux%u format %#x target %d levels %u flags %#x, pool %p flags %#x: storage %p (pool offset %#llx) %llu MB (%llu MB of it in memory before, %llu MB after), Metal %llu MB, %s; "
-         "storage checks so far %llu MB read, %llu MB skipped as never written", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
+         "storage checks so far %llu MB read, %llu MB skipped as never written, %llu MB unreadable", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
          t->d.flags, (const void *)t->pool, t->pool ? t->pool->flags : 0, (const void *)t->mem, (unsigned long long)t->off, (unsigned long long)(t->L.size >> 20), (unsigned long long)(before >> 20), (unsigned long long)(mem_charged(t->mem, t->L.size) >> 20),
-         (unsigned long long)(mt ? mt.allocatedSize >> 20 : 0), how, (unsigned long long)(atomic_load(&g_mem_any_read) >> 20), (unsigned long long)(atomic_load(&g_mem_any_skip) >> 20));
+         (unsigned long long)(mt ? mt.allocatedSize >> 20 : 0), how, (unsigned long long)(atomic_load(&g_mem_any_read) >> 20), (unsigned long long)(atomic_load(&g_mem_any_skip) >> 20),
+         (unsigned long long)(atomic_load(&g_mem_any_unread) >> 20));
 }
 // A sparse texture is bound from its first level whose pages, and those of every smaller level, are all mapped: a view of levels [r, n) samples as with a minimum LOD of r.
 // The translator drops TEX's LOD clamp and residency predicate, so Monster Hunter Rise's streamed textures were sampled at levels it had not mapped yet; those read 0, which ASTC
@@ -13154,7 +13158,8 @@ void mtl_mem_textures(FILE *f) { @autoreleasepool {
     pthread_mutex_lock(&g_mu);
     for (int k = 0; k < PR_SITES && g_pr_site[k].n; k++) fprintf(f, "%d\t%llu\t%.1f\n", g_pr_site[k].line, (unsigned long long)g_pr_site[k].n, g_pr_site[k].bytes / 1048576.0);
     pthread_mutex_unlock(&g_mu);
-    fprintf(f, "\nstorage checks (mem_any)\t%.1f MiB read\t%.1f MiB skipped as never written\n", atomic_load(&g_mem_any_read) / 1048576.0, atomic_load(&g_mem_any_skip) / 1048576.0);
+    fprintf(f, "\nstorage checks (mem_any)\t%.1f MiB read\t%.1f MiB skipped as never written\t%.1f MiB unreadable, taken as zeros\n", atomic_load(&g_mem_any_read) / 1048576.0,
+            atomic_load(&g_mem_any_skip) / 1048576.0, atomic_load(&g_mem_any_unread) / 1048576.0);
     pthread_mutex_lock(&g_srt_mu);
     fprintf(f, "sparse render targets (DM_NVN_SPARSE_RT)\t%u made\t%llu Metal tiles\t%.1f MiB in %lu heaps\t%llu tile mappings made\t%llu taken off\n", atomic_load(&g_srt_n),
             (unsigned long long)g_srt_tiles, g_srt_tiles * (double)SPARSE_TILE / 1048576.0, (unsigned long)g_srt_heaps.count, (unsigned long long)g_srt_maps, (unsigned long long)g_srt_unmaps);
