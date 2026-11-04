@@ -13,20 +13,22 @@ Start it with the iPhone on LiveContainer's list and press Enter the moment you 
 Then follow the steps; 20 s before each one it says what comes next. While it runs, Enter alone marks a moment (a stall, a freeze, the app closing) and a word then Enter marks
 it with that word; q then Enter ends the session early. The session file has one line per step and per mark: the seconds since the launch, the Mac's clock, the kind, the text.
 Nothing leaves this Mac."""
-import argparse, shutil, subprocess, sys, threading, time
+import argparse, re, shutil, subprocess, sys, threading, time
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
 # The default plan (Mario Kart World, a test of the iPhone app after a memory fix for the menus): start, name, what to do.
-# 'menu 1' is the Grand Prix class screen, where the Mac's malloc used to climb about 3 MiB/s (run A) and stayed flat with DM_NVN_VC_WAYS=64 (run C1).
+# 'menu 1' is the Grand Prix class screen, where the Mac's malloc used to climb about 3 MiB/s (run A) and stayed flat with DM_NVN_VC_WAYS=64 (run C1); the game asks for
+# the character, the kart and the cup before it. The main menu is only passed through: its live scene streams the world, and left alone there for 11 min the Mac's footprint
+# went past the phone's limit after about 8 (run C2).
 PLAN = [
     ('0:00', 'lancement', "Le jeu se lance. Ne touche à rien jusqu'à l'écran titre."),
-    ('1:00', 'menu 1', "Passe l'écran titre, choisis Grand Prix et arrête-toi sur le choix de la cylindrée (50cc, 100cc, 150cc). Ne touche plus à rien pendant 3 minutes."),
-    ('4:00', 'course 1', "Choisis la cylindrée, ton personnage et une coupe, puis joue la première course jusqu'au bout."),
+    ('1:00', 'menu 1', "Passe l'écran titre, choisis Grand Prix, ton personnage, ton kart et une coupe, puis arrête-toi sur le choix de la cylindrée (50cc, 100cc, 150cc). Ne touche plus à rien pendant 3 minutes."),
+    ('4:00', 'course 1', "Choisis la cylindrée et joue la première course jusqu'au bout."),
     ('8:00', 'menu 2', "Course finie : reste sur l'écran de fin de course ou le menu qui suit, sans toucher à rien, pendant 3 minutes."),
-    ('11:00', 'balade', "Quitte vers le menu principal et pars en balade libre : roule partout pendant 3 minutes."),
+    ('11:00', 'balade', "Quitte vers le menu principal, sans t'y arrêter, et lance Free Roam : roule partout pendant 3 minutes."),
     ('14:00', 'fin', "C'est fini : ferme le jeu, puis dépose log.txt et memstat.tsv à la racine d'iCloud Drive."),
 ]
 
@@ -49,12 +51,12 @@ def load_plan(path):
     return steps
 
 
-def french_voice():   # the first fr_FR voice macOS has, else None (say's default voice)
+def french_voice():   # Thomas when macOS has it, else its first fr_FR voice, else None (say's default voice)
     try: out = subprocess.run(['say', '-v', '?'], capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError): return None
-    for line in out.splitlines():
-        if 'fr_FR' in line: return line.split('  ')[0].strip()
-    return None
+    # a line: the name (it may hold spaces and brackets: "Eddy (Français (France))"), the locale, then "# " and a sample sentence
+    names = [m.group(1).strip() for m in (re.match(r'(.+?)\s+fr_FR\b', line) for line in out.splitlines()) if m]
+    return next((n for n in names if n.split(' (')[0] == 'Thomas'), names[0] if names else None)
 
 
 class Session:
@@ -97,7 +99,8 @@ class Session:
             if not self.wait_until(at): return
             self.note('step', name, at)
             nxt = self.steps[n + 1] if n + 1 < len(self.steps) else None
-            with self.lock: print(f'\n=== {mmss(at)}  {name.upper()} ({n + 1}/{len(self.steps)}){"  jusqu'à " + mmss(secs(nxt[0])) if nxt else ""} ===', flush=True)
+            until = f"  jusqu'à {mmss(secs(nxt[0]))}" if nxt else ''   # outside the f-string below: macOS's /usr/bin/python3 (3.9) takes no quote of the same kind inside one
+            with self.lock: print(f'\n=== {mmss(at)}  {name.upper()} ({n + 1}/{len(self.steps)}){until} ===', flush=True)
             self.say(what)
         self.say('Session terminée. Appuie sur Entrée pour fermer.')
         self.done.set()
