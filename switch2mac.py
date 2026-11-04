@@ -373,8 +373,9 @@ def run_game(a):
     """The build straight from ./work, without packing an app: the way to try a new game or a fix. Output goes to the terminal and work/logs/run-<time>.log;
     VAR=value arguments add host switches (docs/porting.md lists the useful ones). work/run/ctl.txt is the host's control file (DM_CTL): write a command
     line into it while the game runs (shot, passdump, texraw, memdump, ...). Shaders the game meets that the build lacks are saved to work/run/shdump.
-    The disk guard (disk_guard) watches the disk of the guest file's folder (DM_GUEST_FILE_DIR, else the temporary folder): with under 25 GB free the game does not start, the log gets the
-    free space every 30 s and once more 30 s after the game has exited, and under 5 GB the game is stopped; DM_DISK_GUARD=0 turns it off. With --phone, work/logs/disk-<time>.tsv gets the
+    When the run uses the guest file (DM_GUEST_FILE > 0, as run --phone does; DM_DISK_GUARD=1 or 0 forces it on or off), the disk guard (disk_guard) watches the disk of the guest file's
+    folder (DM_GUEST_FILE_DIR, relative to work/run, else the host's temporary folder, host_temp): with under 25 GB free (as statvfs counts it) the game does not start, the log gets the
+    free space every 30 s and once more 30 s after the game has exited, and under 5 GB the game is stopped. With --phone, work/logs/disk-<time>.tsv gets the
     internal disk's writes and the system's paging every 10 s (disk_sampler; DM_DISK_SAMPLER=1 or 0 forces it)."""
     w = paths(a)[0]; tf = w / 'title.txt'
     if not tf.exists(): sys.exit('no finished build: run build first')
