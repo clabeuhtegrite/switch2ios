@@ -14,7 +14,7 @@ The dump folder holds exefs/ (main, main.npdm, sdk, ...) and romfs/, or base/exe
 Everything the build writes goes to ./work (--work names another folder). Nothing of the game is in this repository.
 Each supported game has a folder in games/ (game.json names it); its profile is nxnative/dm/games/<title ID>.
 """
-import argparse, datetime, hashlib, json, os, re, shutil, struct, subprocess, sys
+import argparse, datetime, hashlib, json, os, re, shutil, struct, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -264,10 +264,111 @@ def install(a):
     print(f'installed: {dst}\nThe first start after each install waits 1-3 minutes while macOS scans the app (no window, no Dock icon yet): wait, do not open it twice.')
 
 
+GB = 1 << 30   # as the host's [mem] lines count it (hle_svc.c)
+DISK_START, DISK_STOP = 25 * GB, 5 * GB   # run's disk guard: the room on the disk of the guest file's folder that a run needs to start, and the room under which the game is stopped
+DISK_POLL, DISK_EVERY, DISK_AFTER, DISK_SAMPLE = 2, 30, 30, 10   # seconds: the guard's checks, its log lines, its last line after the game has exited; the disk sampler's rows
+
+
+def gb(n): return '?' if n is None else f'{n / GB:.1f}'
+
+
+def disk_free(d):   # bytes free to this user on the disk of folder d (statvfs f_bavail, as the host's guest file lines read it), or None when it cannot be read
+    try: return shutil.disk_usage(d).free
+    except OSError: return None
+
+
+def disk_guard(p, d, free0, t0, done, stopped, out):
+    """run's disk guard while the game runs (DM_DISK_GUARD=0 turns it off): the room left on the disk of the guest file's folder every 2 s and in the log every 30 s, and under 5 GB the game
+    is stopped before the disk fills, with SIGTERM (the host's graceful exit), then SIGKILL 5 s later. With DM_GUEST_FILE the kernel writes the guest's pages out to a file in
+    that folder, and macOS swaps to the same disk when memory runs short; what either does on a full disk was not tried. The signals do not wait on the lines, since writing one waits for the
+    terminal, which may have stopped reading: SIGTERM goes before the [RED] line, and SIGKILL comes from a thread of its own (the host logs before it arms its own 1.5 s exit, and that log line
+    waits on this process reading its output)."""
+    n, unread, every = 0, False, max(1, round(DISK_EVERY / DISK_POLL))
+    try:
+        while not done.wait(DISK_POLL):
+            free = disk_free(d); n += 1; t = time.monotonic() - t0
+            if free is None:
+                if not unread: out(f'[switch2mac] [RED] [disk] cannot read the free space on the disk of {d} at {t:.0f} s: until it can, nothing stops the game if the disk fills\n')
+                unread = True; continue
+            unread = False
+            if free < DISK_STOP:
+                stopped.set(); p.terminate()
+                def kill():
+                    if not done.wait(5) and p.poll() is None: p.kill(); out('[switch2mac] [RED] [disk] the game still ran 5 s after SIGTERM: killed (SIGKILL)\n')
+                threading.Thread(target=kill, daemon=True).start()
+                out(f'[switch2mac] [RED] [disk] {gb(free)} GB free at {t:.0f} s, under {DISK_STOP // GB}: the game is stopped before the disk fills (SIGTERM, then SIGKILL after 5 s)\n')
+                return
+            if n % every == 0: out(f'[switch2mac] [disk] {gb(free)} GB free at {t:.0f} s ({round((free - free0) / GB, 1) + 0:+.1f} since the start)\n')   # + 0: no -0.0
+    except Exception as x: sys.stderr.write(f'[switch2mac] [RED] [disk] the disk guard stopped ({x!r}): nothing stops the game if the disk fills\n')
+
+
+def ioreg_disks(text):
+    """The disks in ioreg -r -c IOBlockStorageDriver -k Statistics: [name, bytes written, bytes read] for each block storage driver (a subclass too, as an optical drive's), the name being
+    that of the media below it (APPLE SSD AP0512Z Media); None where the text lacks it: a drive without media has no name, and a key missing from its Statistics stays None."""
+    disks = []
+    for line in text.splitlines():
+        o = re.search(r'\+-o (.+?)\s+<class (\w+)', line)
+        if o and o[2].endswith('BlockStorageDriver'): disks.append([None, None, None])
+        elif not disks: continue
+        elif o:
+            if disks[-1][0] is None and o[2].endswith('Media'): disks[-1][0] = o[1]   # the first media below the driver: the whole disk (its partitions come after it)
+        elif '"Statistics"' in line:
+            for i, k in ((1, 'Write'), (2, 'Read')):
+                m = re.search(r'"Bytes \(' + k + r'\)"\s*=\s*(\d+)', line)
+                if m: disks[-1][i] = int(m[1])
+    return disks
+
+
+def internal_disk(disks, name=None):
+    """Among ioreg_disks: the disk named name (the one the first sample chose), else the first APPLE SSD (a Mac's own), else the first with media and statistics, else the first with statistics.
+    None when there is none: ioreg did not answer, or the disk named is gone."""
+    if name: return next((x for x in disks if x[0] == name), None)
+    for ok in (lambda x: (x[0] or '').startswith('APPLE SSD'), lambda x: x[0] and x[1] is not None, lambda x: x[1] is not None or x[2] is not None):
+        d = next((x for x in disks if ok(x)), None)
+        if d: return d
+    return None
+
+
+def vm_counts(text):   # vm_stat's counts by name (Pageins, Swapouts, ...), and its page size in bytes, None when its first line does not give it
+    n = {m[1]: int(m[2]) for m in re.finditer(r'^"?([^":\n]+?)"?:\s+(\d+)\.?\s*$', text, re.M)}
+    ps = re.search(r'page size of (\d+) bytes', text)
+    return n, int(ps[1]) if ps else None
+
+
+def disk_sampler(path, d, t0, done):
+    """run's disk statistics (work/logs/disk-<time>.tsv; on with --phone, DM_DISK_SAMPLER=1 or 0 forces it): every 10 s, and once more when the game has exited, what the internal disk has
+    written and read in all (ioreg's block storage statistics), vm_stat's page-ins, page-outs, swap-ins and swap-outs, and the room left on the disk of the guest file's folder: what the
+    system writes and pages for DM_GUEST_FILE (docs/ios.md). It fails soft: a value a tool does not give stays empty, a tool gets 10 s, and an error ends the sampler with a line saying so,
+    never the game."""
+    def tool(*cmd):
+        try: return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError): return ''
+    try:
+        with open(path, 'w') as f:
+            name, rows, nxt = None, 0, t0
+            while True:
+                t = time.monotonic() - t0
+                disk = internal_disk(ioreg_disks(tool('ioreg', '-r', '-c', 'IOBlockStorageDriver', '-k', 'Statistics', '-w', '0')), name)   # -w 0: lines never cut at a width
+                vm, page = vm_counts(tool('vm_stat')); free = disk_free(d)
+                if not rows:   # the disk the first sample chose stays the one of every row, so that its counters are one disk's
+                    name = disk and disk[0]
+                    f.write(f'# disk_written, disk_read: bytes the internal disk ({(name or "no media name") if disk else "none found at the start"}) has written and read since the Mac started (ioreg, IOBlockStorageDriver '
+                            f"Statistics); pageins, pageouts, swapins, swapouts: vm_stat's counts since the Mac started, in pages of {page or '?'} bytes; free: bytes free on the disk of {d}; "
+                            'an empty field: the tool did not give it\nseconds\tdisk_written\tdisk_read\tpageins\tpageouts\tswapins\tswapouts\tfree\n')
+                vals = [disk and disk[1], disk and disk[2]] + [vm.get(k) for k in ('Pageins', 'Pageouts', 'Swapins', 'Swapouts')] + [free]
+                f.write('\t'.join([f'{t:.0f}'] + ['' if v is None else str(v) for v in vals]) + '\n'); f.flush(); rows += 1
+                if done.is_set(): return
+                nxt += DISK_SAMPLE; done.wait(max(0, nxt - time.monotonic()))
+    except Exception as x: sys.stderr.write(f'[switch2mac] [RED] [disk] the disk sampler stopped ({x!r}): the game goes on\n')
+
+
 def run_game(a):
     """The build straight from ./work, without packing an app: the way to try a new game or a fix. Output goes to the terminal and work/logs/run-<time>.log;
     VAR=value arguments add host switches (docs/porting.md lists the useful ones). work/run/ctl.txt is the host's control file (DM_CTL): write a command
-    line into it while the game runs (shot, passdump, texraw, memdump, ...). Shaders the game meets that the build lacks are saved to work/run/shdump."""
+    line into it while the game runs (shot, passdump, texraw, memdump, ...). Shaders the game meets that the build lacks are saved to work/run/shdump.
+    The disk guard (disk_guard) watches the disk of the guest file's folder (DM_GUEST_FILE_DIR, else the temporary folder): with under 25 GB free the game does not start, the log gets the
+    free space every 30 s and once more 30 s after the game has exited, and under 5 GB the game is stopped; DM_DISK_GUARD=0 turns it off. With --phone, work/logs/disk-<time>.tsv gets the
+    internal disk's writes and the system's paging every 10 s (disk_sampler; DM_DISK_SAMPLER=1 or 0 forces it)."""
     w = paths(a)[0]; tf = w / 'title.txt'
     if not tf.exists(): sys.exit('no finished build: run build first')
     tid = tf.read_text().strip(); g = GAMES[tid]; r = w / 'run'
@@ -295,14 +396,48 @@ def run_game(a):
     log = w / 'logs' / f'run-{stamp}.log'
     print(' '.join(f'{k}={e[k]}' for k in sorted(e) if k.startswith('DM_')) + ' ' + ' '.join(cmd))
     if a.print: return
+    guard = e.get('DM_DISK_GUARD') != '0'   # disk_guard: on unless DM_DISK_GUARD=0
+    smp = w / 'logs' / f'disk-{stamp}.tsv' if {'1': True, '0': False}.get(e.get('DM_DISK_SAMPLER'), a.phone) else None   # disk_sampler: on with --phone, unless DM_DISK_SAMPLER says
+    gd = (e.get('DM_GUEST_FILE_DIR') or tempfile.gettempdir()) if guard or smp else None   # the guest file's folder (hle_svc.c guest_file_init), whose disk the guard watches
+    free0 = first = None
+    if guard:   # the room to start with, or the run stops here
+        where = f'{"DM_GUEST_FILE_DIR" if e.get("DM_GUEST_FILE_DIR") else "the temporary folder"} ({gd})'
+        try: free0 = shutil.disk_usage(gd).free
+        except OSError as x: first = f'[switch2mac] [RED] [disk] cannot read the free space on the disk of {where} ({x}): no disk guard in this run\n'
+        else:
+            if free0 < DISK_START:
+                sys.exit(f'stopped: {gb(free0)} GB free on the disk of {where}, under {DISK_START // GB} GB. A run takes room there as it goes: with DM_GUEST_FILE=1 (the iPhone settings, '
+                         f"run --phone) the kernel writes the guest's memory out to a file in that folder, up to all the game has touched, and macOS swaps to that disk when memory runs "
+                         f'short; under {DISK_STOP // GB} GB the run stops the game. Make room, or run with DM_DISK_GUARD=0 to start anyway')
+            first = f'[switch2mac] [disk] {gb(free0)} GB free on the disk of {where} at the start: the game is stopped under {DISK_STOP // GB} GB (DM_DISK_GUARD=0 turns this off)\n'
     print(f'log: {log}', flush=True)
+    if smp: print(f'disk statistics: {smp}', flush=True)
+    lock, done, stopped, jobs = threading.Lock(), threading.Event(), threading.Event(), []
+    def out(line):   # a whole line to the terminal and the log, from the loop below or the disk guard's thread; once the log is closed, appended to it
+        with lock:
+            sys.stdout.write(line)
+            if not f.closed: f.write(line)
+            else:
+                with log.open('a') as fa: fa.write(line)
     with log.open('w') as f:
-        p = subprocess.Popen(cmd, env=e, cwd=r, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
-        for line in p.stdout: sys.stdout.write(line); f.write(line)
-    rc = p.wait()
+        if first: out(first)
+        p = subprocess.Popen(cmd, env=e, cwd=r, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace'); t0 = time.monotonic()
+        if free0 is not None: jobs.append(threading.Thread(target=disk_guard, args=(p, gd, free0, t0, done, stopped, out), daemon=True))
+        if smp: jobs.append(threading.Thread(target=disk_sampler, args=(smp, gd, t0, done), daemon=True))
+        for j in jobs: j.start()
+        for line in p.stdout: out(line)
+    rc = p.wait(); done.set(); t1 = time.monotonic()
+    for j in jobs: j.join(25)   # the guard's last line before the ones below, and the sampler's last row, as the game exits (each tool gets 10 s)
+    fx = disk_free(gd) if free0 is not None else None
+    if free0 is not None: out(f'[switch2mac] [disk] {gb(fx)} GB free as the game exits; the free space again {DISK_AFTER} s later (Ctrl-C skips it)\n')
     ms = r / e.get('DM_MEMSTAT', '')   # the host's working directory is the run folder
     if ms.is_file(): subprocess.run([py(), ROOT / 'tools/memstat.py', ms])   # the run's memory, summed up
-    sys.exit(rc)
+    if free0 is not None:   # what the disk got back once the guest file was gone and the system had given back its swap
+        try:
+            time.sleep(max(0, t1 + DISK_AFTER - time.monotonic()))
+            out(f'[switch2mac] [disk] {gb(disk_free(gd))} GB free {DISK_AFTER} s after the game exited ({gb(fx)} as it exited, {gb(free0)} at the start)\n')
+        except KeyboardInterrupt: print()
+    sys.exit(rc or int(stopped.is_set()))   # 1 when the guard stopped the game, whose graceful exit returns 0
 
 
 def main():
@@ -313,7 +448,7 @@ def main():
     rp = sub.add_parser('refresh'); rp.add_argument('--force', action='store_true', help='rebuild even with no new shaders')
     sub.add_parser('install')
     gp = sub.add_parser('run'); gp.add_argument('vars', nargs='*', help='host switches, VAR=value'); gp.add_argument('--print', action='store_true', help='show the command only')
-    gp.add_argument('--phone', action='store_true', help="the iPhone app's switches (games/<game>/env_ios.txt) and memory statistics: the phone's settings tried on the Mac")
+    gp.add_argument('--phone', action='store_true', help="the iPhone app's switches (games/<game>/env_ios.txt), memory statistics and disk statistics (work/logs/disk-*.tsv): the phone's settings tried on the Mac")
     gp.add_argument('--memstat', action='store_true', help='memory statistics (work/logs/memstat-*.tsv) and address regions (work/logs/regions-*.tsv) beside the log')
     ip = sub.add_parser('ios'); ip.add_argument('--xcode', action='store_true', help='an Xcode project to sign with your team and run on the phone, instead of the IPA')
     ip.add_argument('--romfs', action='store_true', help="the game files packed into the app (<name>-full.ipa), instead of copied into its Documents folder")
