@@ -27,8 +27,11 @@ DM_NVN_VC_WAYS=64
 # MapPhysicalMemory limited to the application pool, as on the console (docs/ios.md). Without it the alias region grew from 1.25 to 2.25 GB over four races (test 5);
 # with it on the Mac (run C3, 4 Nov) it stayed at 1.25 GB with no map refused, and after 8 minutes on the main menu the footprint was 5.54 GB instead of 6.17 (run C2)
 DM_MEM_MAP_LIMIT=1
-# No pipeline warm-up (part M ran without it): about 214 MiB less at the peak and no 70 s of preparation at the start; pipelines are built when first drawn instead
-DM_PSO_MANIFEST=off
+# Pipeline warm-up on again (it was off here, as in part M: about 214 MiB less at the peak and no 70 s of preparation at the start). With DM_MEM_MAP_LIMIT the phone's peak was
+# 5404 MiB in test 6 (4 Nov), 828 MiB under the limit, and 78 % of its slow frames were pipelines built while the game played. Now the start prepares the profile's list and this
+# phone's own before the first frame, with a progress screen: longest at the first start after an install (Metal's cache is empty then). DM_PSO_MANIFEST=off in Documents/env.txt
+# turns it off without a new IPA
+# DM_PSO_MANIFEST=off
 # The guest memory layout for a phone, from the measuring runs on the Mac (docs/ios.md, "Fitting into a phone's memory"). Unset, the profile's 20 GB block is reserved, which only an
 # app with extended virtual addressing can do. Sizes in bytes, or whole K / M / G
 #DM_ALIAS_SIZE=3G
