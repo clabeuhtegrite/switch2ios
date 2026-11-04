@@ -31,7 +31,7 @@ These are packed into the app as `dm/env.txt`. On the phone, `Documents/env.txt`
 - `DM_MEMSTAT=memstat.tsv` (in Documents) and `DM_MEMSTAT_WALK_EVERY=10`.
 - Pipeline warm-up: left on, as the fork's IPA has had it since test 6.
 
-nxnative's seed list for Mario Kart World is still empty, and the fork's recorded list does not carry over: none of its 5,373 shader keys is in this shader map. So the first session builds its pipelines in play, and later starts warm up what the phone recorded (`pso_user.tsv`).
+nxnative's seed list for Mario Kart World is still empty. The fork's recorded list keys its shaders another way: none of its 5,373 keys is in this shader map. `tools/pso_translate.py` gives that list this chain's keys, after a list recorded on the Mac with `DM_PSO_RECORD`, and its output replaces `dm/games/0400C3F00006E000/pso_manifest.tsv` before the IPA is built. With the list empty, the first session builds its pipelines in play, and later starts warm up what the phone recorded (`pso_user.tsv`).
 
 ## Building the IPA
 
@@ -66,6 +66,7 @@ It sets `DM_MEM_CAP_GB=10` and will not start a second host. A fork run with the
 - `tools/memstat.py [memstat.tsv] [--session FILE]`: summary of a memstat file, from the phone (`Documents/memstat.tsv`) or from `mac_run.py`.
 - `tools/phone_session.py`: a timecoded session on the iPhone, guided from the Mac. Its file splits the phone's memstat into parts.
 - `tools/nocopy_cross.m`: checks that Metal no-copy buffers and `vm_remap` work over a pool that crosses from one guest file into the next. No game needed.
+- `tools/pso_translate.py`: the fork's recorded pipeline list in this chain's shader keys. Both chains hash the same bytes of each shader in the game files, each in its own way, so the script walks the RomFS (and main, and the fork's run-time shader dumps) and hashes each shader both ways. It stops if the walk gives back under 90 % of the fork map's keys. The output holds only identifiers and render state, like the list it comes from.
 
 ## What the fork had that this branch leaves out
 
@@ -78,7 +79,7 @@ It sets `DM_MEM_CAP_GB=10` and will not start a second host. A fork run with the
 | Cutting the sdk's node area for build 90ebba18 | It only saved address space, and nxnative runs without it. |
 | Metal's memory by kind and the texture list in memstat | They would need porting onto nxnative's pools. Those columns read `-`. |
 | The paging counters in `hle_nvn.c`, `prog_shared` | Tied to switch2mac's code. |
-| The recorded pipeline list (12,306 lines) | Its shader keys are not this map's. |
+| The recorded pipeline list as it is (12,306 lines) | Its shader keys are not this map's. `tools/pso_translate.py` translates it. |
 
 ## Updating from nxnative
 

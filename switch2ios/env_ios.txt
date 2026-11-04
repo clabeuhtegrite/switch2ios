@@ -19,9 +19,10 @@ DM_MEMSTAT=memstat.tsv
 DM_MEMSTAT_WALK_EVERY=10
 # Pipeline warm-up on (the default), as in the fork since its test 6 (4 Nov): with DM_MEM_MAP_LIMIT the phone's peak was 5,404 MiB, 828 MiB under the limit, and 78 % of the
 # slow frames were pipelines built while the game played; the warm-up costs about 214 MiB at the peak and about 70 s at the first start after an install (Metal's cache is empty).
-# Here the profile's seed list is still empty (nxnative's pso_manifest.tsv is provisional, and the fork's recorded list does not carry over: none of its 5,373 shader keys is in
-# this shader map), so the start builds what this phone recorded in its earlier runs (pso_user.tsv) and the first session builds its pipelines in play. To try next: a list
-# recorded on the Mac (DM_PSO_MANIFEST=off DM_PSO_RECORD), and a pipeline archive (build_ipa_from_nsp.py --gpu). DM_PSO_MANIFEST=off in Documents/env.txt turns it off
+# nxnative's seed list (the profile's pso_manifest.tsv) is still empty, and the fork's recorded list keys its shaders another way (none of its 5,373 keys is in this shader map):
+# switch2ios/tools/pso_translate.py gives it this chain's keys, after a list recorded on the Mac (DM_PSO_RECORD), and its output replaces pso_manifest.tsv before the IPA is built.
+# With the list empty, the start builds what this phone recorded in its earlier runs (pso_user.tsv) and the first session builds its pipelines in play. Also to try: a pipeline
+# archive (build_ipa_from_nsp.py --gpu). DM_PSO_MANIFEST=off in Documents/env.txt turns the warm-up off
 # DM_PSO_MANIFEST=off
 #
 # Not carried over from the fork, because nxnative main does this by default: DM_NVN_DESWZ_GPU=2 and DM_NVN_SPARSE_RT / SPARSE_FREE / SPARSE_SHARE=1 (here large pools are wired
