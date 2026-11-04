@@ -2,13 +2,18 @@
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <unistd.h>
 #include <sched.h>
 #include <time.h>
 #include <stdatomic.h>
 #include <mach/mach.h>
+#include <TargetConditionals.h>
 
 // Reserve one whole block of guest address space, partitioned the Horizon way (address values are the real addresses returned by the host's mmap).
 // It only takes address space, not memory.
@@ -51,6 +56,56 @@ static size_t va_probe(void) {
     }
     return lo;
 }
+// DM_GUEST_FILE=1: the guest's memory in a file as large as the block, mapped shared over the reservation at the same addresses. File pages do not count in phys_footprint, the figure iOS ends an
+// app at (about 6 GB on a 12 GB iPhone), which otherwise charges every page the game has touched; they take the same memory while they stay in it, and the kernel can write them to the file when
+// it needs the room, which it cannot do with an iPhone app's anonymous pages. A page never written reads 0 as before, and mprotect (dirty tracking), vm_remap (virtual pools) and Metal's no-copy
+// buffers work on them as on anonymous pages. The file is sparse and unlinked at once, so it goes with the process, and lies in the user's temporary folder (on iOS NSTemporaryDirectory:
+// DM_GUEST_FILE_DIR, from main.m); the host never flushes it (no msync, no fsync). It takes disk space as pages are written out, at most what the game has touched. When it cannot be made or
+// mapped the guest stays in anonymous memory, with a line saying why. UnmapPhysicalMemory's MADV_FREE gives nothing back on these pages: what the game unmaps stays in the file (F_PUNCHHOLE would free it)
+int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have
+// One line every 10 s: the file's blocks on disk, what the process wrote and dirtied (logical writes), the footprint's parts beside the file pages it has mapped (external: PROT_NONE takes pages out
+// of it, as out of internal), the room left on the disk
+static void *guest_file_thread(void *arg) {
+    int fd = (int)(intptr_t)arg; const double G = 1073741824.0;
+    for (;;) {
+        sleep(10);
+        struct stat st; struct statfs fs; struct rusage_info_v4 ru; task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+        double blocks = fstat(fd, &st) ? -1 : st.st_blocks * 512.0 / G, avail = fstatfs(fd, &fs) ? -1 : (double)fs.f_bavail * fs.f_bsize / G;
+        int ru_ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
+        LOG("[mem] guest file: %.2f GB allocated on disk; process wrote %.2f GB to disk, logical writes %.2f GB; footprint %.2f GB (internal %.2f, compressed %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk",
+            blocks, ru_ok ? ru.ri_diskio_byteswritten / G : -1, ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, vi.external / G, avail);
+    }
+    return NULL;
+}
+static void guest_file_init(void) {
+    const char *e = getenv("DM_GUEST_FILE"); if (!e || atoi(e) <= 0) return;
+    char dir[1024] = "", path[1100]; const char *d = getenv("DM_GUEST_FILE_DIR");
+    if (d && *d) snprintf(dir, sizeof dir, "%s", d);
+    else if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir)) { LOG("[mem] guest memory: anonymous (DM_GUEST_FILE: no temporary folder, errno %d)", errno); return; }
+    snprintf(path, sizeof path, "%s%sguest-%d.mem", dir, dir[0] && dir[strlen(dir) - 1] == '/' ? "" : "/", (int)getpid());
+    int cls = -1;
+#if TARGET_OS_IPHONE
+    // Protection class C (PROTECTION_CLASS_C, which the SDK's headers do not name), whose key stays from the first unlock until the phone restarts: in a class that closes when the phone locks,
+    // the file's pages could no longer be read (SIGBUS). It is also the class an app's files get by default, hence the plain open if this call fails
+    int fd = open_dprotected_np(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 3, 0, 0600);
+    if (fd < 0) fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd >= 0) cls = fcntl(fd, F_GETPROTECTIONCLASS);
+#else
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+#endif
+    if (fd < 0) { LOG("[mem] guest memory: anonymous (DM_GUEST_FILE: cannot create %s, errno %d)", path, errno); return; }
+    unlink(path);
+    if (ftruncate(fd, (off_t)g_reserve)) { LOG("[mem] guest memory: anonymous (DM_GUEST_FILE: cannot size %s to %.2f GB, errno %d)", path, g_reserve / 1073741824.0, errno); close(fd); return; }
+    if (mmap(g_as, g_reserve, PROT_NONE, MAP_SHARED | MAP_FIXED, fd, 0) != g_as) {
+        LOG("[mem] guest memory: anonymous (DM_GUEST_FILE: cannot map %s, errno %d)", path, errno); close(fd);
+        if (mmap(g_as, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) != g_as) die("reserve guest AS again after DM_GUEST_FILE (errno %d)", errno);   // whatever the failed call left there
+        return;
+    }
+    struct statfs fs; double avail = fstatfs(fd, &fs) ? -1 : (double)fs.f_bavail * fs.f_bsize / 1073741824.0;
+    LOG("[mem] guest memory: file %s (unlinked, sparse, shared), %.2f GB, protection class %d (-1 on a Mac), %.1f GB free on its disk", path, g_reserve / 1073741824.0, cls, avail);
+    pthread_t th; if (!pthread_create(&th, NULL, guest_file_thread, (void *)(intptr_t)fd)) pthread_detach(th);
+}
 
 static void *alias_windows_thread(void *arg);
 static void *regions_thread(void *arg);
@@ -80,6 +135,7 @@ static void mem_init_once(void) {
         die("reserve guest AS: %.2f GB (errno %d), and this process can reserve %.2f GB in one piece; iOS without the extended virtual addressing entitlement reserves about 6 GB at most: "
             "DM_ALIAS_SIZE / DM_HEAP_REGION make the block smaller", g_reserve / 1073741824.0, err, va_probe() / 1073741824.0);
     }
+    guest_file_init();
     // Fixed partition (all inside the reserved block): alias 2.875 GB, stack 256 MB, heap the remaining 1.625 GB.
     // In newer SDKs the AddressRegionManager always takes 0x3fe00000 (~1 GB) at the start of the alias region as its node area (sdk 0x134728) before handing out regions; with a 512 MB alias region the very first AllocateAddressRegion fails (0x1803).
     // SMBW also defines a 1792000 KB (1.75 GB) VirtualAddressMemory in HeapDef (System/HeapSize): it is subtracted from the memory pool before the heap is opened (SetHeapSize asks for only 0x5be00000),
