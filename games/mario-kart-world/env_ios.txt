@@ -12,6 +12,11 @@ DM_NVN_SPARSE_RT=1
 # the terrain's sparse tiles the game unmaps give their memory back, and its tiles over the same physical tile share one Metal tile (heaps 4.4 GB -> 2.0 GB by the end of free roam)
 DM_NVN_SPARSE_FREE=1
 DM_NVN_SPARSE_SHARE=1
+# The guest's memory in a file (hle_svc.c), out of the footprint iOS ends the app at; the kernel writes its pages out when it needs the room. On the Mac (part M, docs/ios.md):
+# footprint peak 5.62 GiB instead of 11.58, the picture unchanged, more long frames and 24 s more to the first frame, the Mac short of free memory. Not tried on a phone yet
+DM_GUEST_FILE=1
+# No pipeline warm-up (part M ran without it): about 214 MiB less at the peak and no 70 s of preparation at the start; pipelines are built when first drawn instead
+DM_PSO_MANIFEST=off
 # The guest memory layout for a phone, from the measuring runs on the Mac (docs/ios.md, "Fitting into a phone's memory"). Unset, the profile's 20 GB block is reserved, which only an
 # app with extended virtual addressing can do. Sizes in bytes, or whole K / M / G
 #DM_ALIAS_SIZE=3G
