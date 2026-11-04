@@ -71,6 +71,8 @@ LiveContainer runs the app inside its own process, so the app has LiveContainer'
 
 Sizes are bytes, or whole K / M / G (`DM_APP_POOL=4G`). The guest block is 256 MB + alias region + 256 MB of stacks + heap region; its size and parts are logged at start (`[mem] guest block`).
 
+One switch is read when the shader libraries are built, not when the game runs: `DMSH_FIRST_STORE=0 ./switch2mac.py ios` (or `build`) leaves in the compute shaders the stores that only a dispatch's first invocation makes. By default the build takes them out (`nxnative/dm/gfx/tools/dmsh_first.py`) and the host makes them before each dispatch, as nxnative c8521ee and e07cba1 do: the console starts the first workgroup ahead of the others, Apple's GPUs start workgroups in no order, and a list's counter that the first invocation reset after other workgroups had added to it lost their entries (Mario Kart World's trees, bushes, cacti and rocks, gone in blocks while their shadows stay). The switch is part of every shader's cache key, so changing it rebuilds the shaders; the log's `first-invocation stores` line names the first shader the host makes them for. `python3 nxnative/dm/gfx/tools/dmsh_first.py work/cache/metal_shader_cache/b-<chain>` says, read-only, what a build would take from a library built before.
+
 ## Fitting into a phone's memory
 
 On the Mac first, where a run that fails costs a minute:

@@ -11035,6 +11035,22 @@ static void cs_spill_bind(id ce, NvShader *cs, const p_dispatch *dp) {
     if (dp->ind) cs->spill_ind = 1;
     static int over; if (groups > CS_SPILL_SLICES && !over++) MLOG("[RED] compute shader %s: %llu thread groups, more than %d slices: groups share slices (modulo)", cs->key, (unsigned long long)groups, CS_SPILL_SLICES);
 }
+// The stores to storage buffer words that only a dispatch's first invocation makes (nvn_refl.h first): the Switch starts that workgroup ahead of the others, Apple's GPUs start
+// workgroups in no order, so the build takes them out of the shader (dmsh_first.py) and they are made here, in order, before the dispatch. A list's counter that the first invocation
+// reset after other workgroups had appended lost their entries: Mario Kart World's trees, bushes, cacti and rocks vanished in blocks, their shadows kept (nxnative c8521ee, e07cba1)
+static uint64_t g_first_stores;
+static void first_stores(NvShader *cs) {
+    for (int i = 0; i < cs->rf.nfirst; i++) {
+        const nvn_rbind *b = &cs->rf.b[cs->rf.first[i].bind];
+        const p_bind_buf *u = b->reg >= 16 ? NULL : b->kind == NVN_RB_UBOP ? &S.ubo[5][b->reg] : &S.ssbo[5][b->reg];
+        uint64_t a = u && u->addr ? u->addr + 4ull * cs->rf.first[i].word : 0; void *db; uint64_t dof;
+        if (!a) continue;   // nothing bound there: the shader's store went nowhere either
+        if (!mtl_addr(a, 4, &db, &dof)) { RED_ONCE(925, "first-invocation store of compute shader %s: %#llx is in no memory pool", cs->key, (unsigned long long)a); continue; }
+        mtl_sub_fill(a, 4, cs->rf.first[i].value);
+        if (!g_first_stores++) MLOG("first-invocation stores: made by the host before the dispatch (first: compute shader %s, %d of them; DMSH_FIRST_STORE=0 at the build keeps them in the shaders)", cs->key, cs->rf.nfirst);
+        else if (g_first_stores == 1000 || g_first_stores % 1000000 == 0) MLOG("first-invocation stores: %llu made by the host", (unsigned long long)g_first_stores);
+    }
+}
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
     g_wr_epoch++; g_mdx_epoch++;
@@ -11075,6 +11091,7 @@ static void dispatch(const p_dispatch *dp) {
     }
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "compute shader lacks threadgroup size reflection"); return; }
+    if (cs->rf.nfirst && (dp->ind || (dp->x && dp->y && dp->z))) first_stores(cs);   // see first_stores (an empty direct dispatch runs no first invocation)
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
     rp_end();
     image_prepare(prog_get(S.cprog), 0x20);

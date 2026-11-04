@@ -165,6 +165,14 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
         }
         NSArray *tg = j[@"threadgroup_size"];
         if ([tg isKindOfClass:[NSArray class]] && tg.count == 3) for (int i = 0; i < 3; i++) o->tg[i] = (uint16_t)[tg[i] intValue];
+        NSArray *fs = j[@"first_store"];   // the stores the host makes before each dispatch (nvn_refl.h first)
+        if (fs && (![fs isKindOfClass:[NSArray class]] || fs.count > 4)) FAIL("first_store is not a list of at most 4 stores");
+        for (NSDictionary *u in fs) {
+            id bn = [u isKindOfClass:[NSDictionary class]] ? u[@"bind"] : nil, wn = bn ? u[@"word"] : nil;
+            int bi = [bn isKindOfClass:[NSNumber class]] ? [bn intValue] : -1, word = [wn isKindOfClass:[NSNumber class]] ? [wn intValue] : -1;
+            if (bi < 0 || bi >= o->nb || (o->b[bi].kind != NVN_RB_SBUFP && o->b[bi].kind != NVN_RB_UBOP) || word < 0 || word > 0xffff)
+                FAIL("first-invocation store to binding %d word %d: not a storage buffer word", bi, word);
+            o->first[o->nfirst].bind = (uint8_t)bi; o->first[o->nfirst].word = (uint16_t)word; o->first[o->nfirst++].value = (uint32_t)[u[@"value"] unsignedIntValue]; }
         return 0;
     }
     #undef FAIL

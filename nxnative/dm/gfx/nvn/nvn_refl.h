@@ -45,6 +45,9 @@ typedef struct {
                                                                 // sh[ct]: Metal attribute index of the input's shadow of that component type in the <key>_bv library (0xff = none; dmsh_vin.py)
     uint8_t has_vin;         // has a shadow-input library <key>_bv (nvn_mtl.m vin_fn)
     uint16_t tg[3];          // Compute thread group size (none = 0)
+    // Compute: stores to storage buffer words that only the dispatch's first invocation made, taken out of the shader (dmsh_first.py); the host makes them before each dispatch (nvn_mtl.m dispatch).
+    // bind = the storage buffer's index in b (its slot is known only after nx2_reflect.py for a Switch 2 program)
+    struct { uint8_t bind; uint16_t word; uint32_t value; } first[4]; uint8_t nfirst;
     uint8_t route_b, has_c1; // Route B; has a c1 constant segment
     uint8_t bindless;        // Has TEXU / SAMPU bindings (which texture is read is known only at replay time)
     uint8_t border;          // index in b of the BORDER binding + 1, 0 = none
