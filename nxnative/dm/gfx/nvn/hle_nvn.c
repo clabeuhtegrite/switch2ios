@@ -1615,10 +1615,60 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // Default (Mac)
 __attribute__((weak)) int dm_low_power_now(void) { return 0; }   // Low Power Mode (iOS front_ios.m); off on the Mac
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup, hy; } lf_rec;   // hy: draws with a hybrid (pulling) pipeline
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup, hy; unsigned vn, vpi, vfa, vpo; double vmb, vpo_s; } lf_rec;   // hy: draws with a hybrid (pulling) pipeline; v…: the paging counters (pgc_take)
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[longframe] %s", what); }   // Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
+// Paging counters (on by default, DM_NVN_FRAME_VM=0 turns them off), so that a long frame on the phone, which has no TSV and no scripts, can be traced to paging in its [longframe] line.
+// A reading at a frame's record takes the process's page faults and page-ins (task_info TASK_EVENTS_INFO; the kernel stops them at INT32_MAX, past which their deltas read 0), what it
+// read from disk (proc_pid_rusage ri_diskio_bytesread: page-ins of file pages, DM_GUEST_FILE's among them, and the game's own file reads, its RomFS among them) and the system's page-outs
+// (host_statistics64 HOST_VM_INFO64 pageouts: pages the kernel wrote out, the guest file's dirty pages among them). XNU answers an app's host_statistics64 2 to 10 times in a 1 s window that
+// all apps share, and the other calls with a copy of its last answer, so the system's counters are asked for every second, and at the end of a frame that looks long at most every 0.25 s, and an answer
+// equal to the last one read, or with fewer page-outs (another caller's older copy, cached after ours), is that copy, not a reading: lf_rec's vpo counts the page-outs over the vpo_s seconds up to the frame's end, or vpo_s is 0. Each reading measures what its calls cost,
+// and the 300-frame interval line gives the mean: when a reading costs more than 50 us on average in two windows in a row of at least 100 readings, the counters are read every 4th frame from then on (and at the end of every
+// frame that looks long), and vn, the frames a reading covers, is then up to 4 (pgc_cost_us)
+int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have (as hle_svc.c declares it)
+static int pgc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_FRAME_VM"); v = !(e && !strcmp(e, "0")); } return v; }
+static int g_pgc_every = 1;                     // frames between two readings: 1, or 4 once a reading costs more than 50 us (pgc_cost_us)
+static uint64_t g_pgc_cost_ns, g_pgc_cost_n;   // what the readings since the last 300-frame summary cost, and how many there were
+static struct { uint64_t f, rd, hs_ns, hs_try; uint32_t fa, pi; int ok; vm_statistics64_data_t hs; } g_pgc;   // the last reading (its frame, bytes read, faults, page-ins); hs: the system's last one, read at hs_ns (0: none yet), last asked for at hs_try
+static void pgc_take(lf_rec *r, uint64_t f, double fr) {   // present thread, at the frame's record
+    r->vn = r->vpi = r->vfa = r->vpo = 0; r->vmb = r->vpo_s = 0;
+    if (!pgc_on()) return;
+    static double mean = 16.7; int longish = fr > 20.0 && fr > 1.4 * mean;   // the long-frame log's test on the frame time, with a sliding mean of its own (the log's is updated 8 frames later); a frame long by its GPU time alone is not known yet
+    mean += ((fr < 3 * mean ? fr : 3 * mean) - mean) / 16;
+    if (!longish && g_pgc.ok && f - g_pgc.f < (uint64_t)g_pgc_every) return;
+    uint64_t t0 = now_ns(); task_events_info_data_t ev; mach_msg_type_number_t n = TASK_EVENTS_INFO_COUNT; struct rusage_info_v4 ru;
+    if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ev, &n) == KERN_SUCCESS && !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru)) {
+        if (g_pgc.ok) { r->vn = (unsigned)(f - g_pgc.f); r->vpi = (uint32_t)ev.pageins - g_pgc.pi; r->vfa = (uint32_t)ev.faults - g_pgc.fa; r->vmb = (ru.ri_diskio_bytesread - g_pgc.rd) / 1048576.0; }
+        g_pgc.ok = 1; g_pgc.f = f; g_pgc.pi = (uint32_t)ev.pageins; g_pgc.fa = (uint32_t)ev.faults; g_pgc.rd = ru.ri_diskio_bytesread;
+    }
+    static host_t host; if (!host) host = mach_host_self();   // once: every call adds a reference to the port
+    if (!g_pgc.hs_try || t0 - g_pgc.hs_try >= (longish ? 250000000ull : 1000000000ull)) {
+        vm_statistics64_data_t hs; mach_msg_type_number_t hn = HOST_VM_INFO64_COUNT; memset(&hs, 0, sizeof hs); g_pgc.hs_try = t0;
+        if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&hs, &hn) == KERN_SUCCESS && memcmp(&hs, &g_pgc.hs, sizeof hs) && hs.pageouts >= g_pgc.hs.pageouts) {
+            if (g_pgc.hs_ns) { r->vpo = (unsigned)(hs.pageouts - g_pgc.hs.pageouts); r->vpo_s = (t0 - g_pgc.hs_ns) / 1e9; }
+            g_pgc.hs = hs; g_pgc.hs_ns = t0;
+        }
+    }
+    g_pgc_cost_ns += now_ns() - t0; g_pgc_cost_n++;
+}
+// The paging part of a [longframe] line: what the frame's reading counted (over the frames it covers when the counters are read every 4th frame), and the system's page-outs read at its end
+static void pgc_note(char *b, size_t n, const lf_rec *r) {
+    char po[64] = "not read at its end"; if (r->vpo_s > 0) snprintf(po, sizeof po, "%u in the %.2f s to its end", r->vpo, r->vpo_s);
+    if (!r->vn) snprintf(b, n, "; page-ins and faults not read, system page-outs %s", po);
+    else if (r->vn == 1) snprintf(b, n, "; page-ins %u (%.1f MB read), faults %u, system page-outs %s", r->vpi, r->vmb, r->vfa, po);
+    else snprintf(b, n, "; page-ins %u (%.1f MB read), faults %u in the %u frames to its end, system page-outs %s", r->vpi, r->vmb, r->vfa, r->vn, po);
+}
+// What a reading cost on average since the last call (us, 0 without one); past 50 us in two windows in a row of at least 100 readings, the counters are read every 4th frame from then on
+static double pgc_cost_us(uint64_t frame) {
+    static int over;   // windows in a row over 50 us
+    double us = g_pgc_cost_n ? g_pgc_cost_ns / 1e3 / (double)g_pgc_cost_n : 0;
+    over = g_pgc_cost_n >= 100 && us > 50 ? over + 1 : 0;
+    if (g_pgc_every == 1 && over >= 2) { g_pgc_every = 4;
+        LOG("[nvn] paging counters: %.1f us a reading over the last %llu (up to frame %llu), more than 50: read every 4th frame from now on, and at the end of every frame that looks long", us, (unsigned long long)g_pgc_cost_n, (unsigned long long)frame); }
+    g_pgc_cost_ns = g_pgc_cost_n = 0; return us;
+}
 static const char *const g_tname[6] = {"frame time", "frame work", "NVN submit+present", "GPU", "translation layer recording", "translation layer submit"};
 static void tpush(int k, double v) { g_tw[k][g_tn[k]++ % TWIN] = v; }
 // Thermal attribution (iOS DM_HEAT): per-frame GPU milliseconds are kept in a separate ring, taking the mean / p95 "since the last read" (at most the last HRN frames), without interfering with the timing summary's 300-frame window
@@ -1688,7 +1738,11 @@ static void tsummary(uint64_t frame) {
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;
-        LOG("[nvn] frame interval up to frame %llu: >%.1fms %u / %u frames, p99 %.2f ms", frame, tgt, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
+        if (!pgc_on()) LOG("[nvn] frame interval up to frame %llu: >%.1fms %u / %u frames, p99 %.2f ms", frame, tgt, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]);
+        else { unsigned o33 = 0, o50 = 0, o100 = 0, o200 = 0; double us = pgc_cost_us(frame);   // with the paging counters: the long frames by length, which the phone has no TSV for, and what a reading cost
+          for (unsigned i = 0; i < n; i++) { o33 += v[i] > 100.0 / 3; o50 += v[i] > 50; o100 += v[i] > 100; o200 += v[i] > 200; }
+          LOG("[nvn] frame interval up to frame %llu: >%.1fms %u / %u frames, p99 %.2f ms; frames over 33.3 / 50 / 100 / 200 ms %u / %u / %u / %u; paging counters %.1f us a reading%s", frame, tgt, over, n,
+              v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1], o33, o50, o100, o200, us, g_pgc_every > 1 ? " (read every 4th frame)" : ""); } } }
     { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // on-screen present: dropped frame = on screen longer than its hold × 1.5 (pres_expect_ms) or discarded
       for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > g_pres_exp[i] * 1.5; } }
       task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT; double fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
@@ -2106,9 +2160,13 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
             r->hy = (unsigned)(hy - phy); plns = lns; ppns = pns; pup = up; prup = rup; pub = ub; phy = hy;
+            pgc_take(r, f, fr);   // paging counters (DM_NVN_FRAME_VM)
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
+        { const lf_rec *r = &g_lf[f % LFN];   // the paging counters' reading at this frame (pgc_take): a row covers the frames since the last reading, and the system's page-outs come only on frames where they were read
+          if (r->vn) { trow(f, "@vm_pageins", r->vpi); trow(f, "@vm_faults", r->vfa); trow(f, "@disk_read_mb", r->vmb); }
+          if (r->vpo_s > 0) trow(f, "@sys_pageouts", r->vpo); }
         trow(f, "@drawable_ms", mtl_drawable_ns_take() / 1e6);
         trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", atomic_exchange(&g_sub_cpu_ns, 0) / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
     } else atomic_store(&g_nvn_ns, 0);
@@ -2121,8 +2179,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           static double ef = 16.7, eg = 8; int lf = r->fr > 20.0 && r->fr > 1.4 * ef, lg = g > 16.7 && g > 1.3 * eg;
           if (r->f == f - 8) { ef += ((r->fr < 3 * ef ? r->fr : 3 * ef) - ef) / 16; eg += ((g < 3 * eg ? g : 3 * eg) - eg) / 16; }
           if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[512];
-              snprintf(b, sizeof b, "frame %llu (%.2f s) whole frame %.1f ms, submit+present %.1f ms, GPU %.1f ms; new pipelines %u + shader libraries %u, %.1f ms in all; texture uploads %u first + %u re-uploads, %.1f MB / %.1f ms; draws with a hybrid pipeline %u",
+              int bn = snprintf(b, sizeof b, "frame %llu (%.2f s) whole frame %.1f ms, submit+present %.1f ms, GPU %.1f ms; new pipelines %u + shader libraries %u, %.1f ms in all; texture uploads %u first + %u re-uploads, %.1f MB / %.1f ms; draws with a hybrid pipeline %u",
                        (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms, r->hy);
+              if (pgc_on() && bn > 0 && (size_t)bn < sizeof b) pgc_note(b + bn, sizeof b - (size_t)bn, r);   // its paging (DM_NVN_FRAME_VM)
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               dm_longframe_note(b); } }
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
@@ -2226,7 +2285,7 @@ _Static_assert(sizeof(map_req) == 0x28, "NVNmappingRequest");
 // mapping) and the later mappings were refused (`[RED] MapVirtual: non-contiguous mapping`). A pool larger than the application pool is sparse from the start
 enum { NVRUN = 1024, VPT_LEAF = 512 };   // a page-table leaf covers 2 MB
 typedef struct { const uint8_t *phys; uint64_t gen; } vpte;
-struct vpool { const pool_t *pool; uint8_t *base; uint64_t len, size, top; int nrun; struct { uint64_t lo, hi; } run[NVRUN]; vpte **pt; uint64_t gen; };   // len: reserved; size: the pool's; top: highest mapped end so far (logged per 128 MB); gen: g_vp_gen of its last mapping request
+struct vpool { const pool_t *pool; uint8_t *base; uint64_t len, size, top; int nrun; struct { uint64_t lo, hi; } run[NVRUN]; vpte **pt; struct { uintptr_t lo, hi; } *pb; uint64_t gen; uintptr_t slo, shi; int lost; };   // len: reserved; size: the pool's; top: highest mapped end so far (logged per 128 MB); gen: g_vp_gen of its last mapping request; slo / shi: the guest addresses its runs were ever remapped from, lost: its run table was once full and may miss a run (both for nvn_vpool_src_covers); pb: per page-table leaf, the guest addresses its entries were ever mapped from (only widened, for nvn_vpool_src_covers)
 static struct vpool **g_vp; static int g_nvp, g_cvp;   // the pools with a range of their own, under g_vp_mu
 static pthread_mutex_t g_vp_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_vp_gen;   // bumped per mapping request
@@ -2242,7 +2301,8 @@ static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL
     void *a = mmap(NULL, len, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (a == MAP_FAILED) { LOG("[RED] virtual pool %p: cannot reserve %#llx bytes of address space (errno %d)", (const void *)o, (unsigned long long)len, errno); return NULL; }
     struct vpool *v = calloc(1, sizeof *v);
-    if (!v || !(v->pt = calloc((o->size + (2u << 20) - 1) >> 21, sizeof *v->pt))) die("sparse pool allocation failed");
+    uint64_t nleaf = (o->size + (2u << 20) - 1) >> 21;
+    if (!v || !(v->pt = calloc(nleaf, sizeof *v->pt)) || !(v->pb = calloc(nleaf, sizeof *v->pb))) die("sparse pool allocation failed");
     v->pool = o; v->base = a; v->len = len; v->size = o->size;
     pthread_mutex_lock(&g_vp_mu);
     if (g_nvp == g_cvp && !(g_vp = realloc(g_vp, (g_cvp = g_cvp ? 2 * g_cvp : 64) * sizeof *g_vp))) die("sparse pool table allocation failed");
@@ -2258,7 +2318,7 @@ static void vpool_drop(pool_t *o) {   // caller holds g_vp_mu
     munmap(v->base, v->len);
     for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
     for (int i = 0; i < g_nvp; i++) if (g_vp[i] == v) { g_vp[i] = g_vp[--g_nvp]; break; }
-    free(v->pt); free(v); o->vp = NULL;
+    free(v->pt); free(v->pb); free(v); o->vp = NULL;
 }
 static void vpool_release(pool_t *o) { pthread_mutex_lock(&g_vp_mu); vpool_drop(o); pthread_mutex_unlock(&g_vp_mu); }
 // Mapped runs of a sparse pool: [lo, hi) sorted, disjoint, adjacent runs merged. Caller holds g_vp_mu
@@ -2273,7 +2333,7 @@ static void vrun_set(struct vpool *v, uint64_t lo, uint64_t hi, int mapped) {
         if (b > hi && nn < NVRUN) { nl[nn][0] = hi; nl[nn][1] = b; nn++; mtl_pool_add(v->base + hi, b - hi); }
     }
     if (mapped && nn < NVRUN) { nl[nn][0] = mlo; nl[nn][1] = mhi; nn++; mtl_pool_add(v->base + mlo, mhi - mlo); }
-    if (nn == NVRUN) LOG("[RED] virtual pool %p: more than %d separate mapped runs", (const void *)v->pool, NVRUN);
+    if (nn == NVRUN) { v->lost = 1; LOG("[RED] virtual pool %p: more than %d separate mapped runs", (const void *)v->pool, NVRUN); }
     for (int a = 1; a < nn; a++) for (int b = a; b > 0 && nl[b][0] < nl[b - 1][0]; b--) { uint64_t t0 = nl[b][0], t1 = nl[b][1]; nl[b][0] = nl[b - 1][0]; nl[b][1] = nl[b - 1][1]; nl[b - 1][0] = t0; nl[b - 1][1] = t1; }
     v->nrun = nn; for (int k = 0; k < nn; k++) { v->run[k].lo = nl[k][0]; v->run[k].hi = nl[k][1]; }
 }
@@ -2286,6 +2346,7 @@ static void vpt_set(struct vpool *v, uint64_t voff, uint64_t size, const uint8_t
         if (!*l && !phys) continue;   // never mapped: stays unmapped
         if (!*l && !(*l = calloc(VPT_LEAF, sizeof **l))) die("sparse pool page table allocation failed");
         (*l)[((voff + o) >> 12) & (VPT_LEAF - 1)] = (vpte){phys ? phys + o : NULL, gen};
+        if (phys) { uintptr_t p = (uintptr_t)(phys + o); __typeof__(*v->pb) *b = &v->pb[(voff + o) >> 21]; if (!b->hi || p < b->lo) b->lo = p; if (p + 0x1000 > b->hi) b->hi = p + 0x1000; }   // the leaf's source bounds (nvn_vpool_src_covers): only widened
     }
 }
 static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp_mu; → 0 on failure
@@ -2312,6 +2373,8 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
     if (kr != KERN_SUCCESS || to != (vm_address_t)(v->base + r->voff)) { LOG("[RED] virtual pool remap %#lx → %p (%#llx bytes) failed: %d", (unsigned long)from, (void *)(v->base + r->voff), (unsigned long long)r->size, kr); return 0; }
     mprotect((void *)to, r->size, PROT_READ | PROT_WRITE);   // the source may be write-protected by the dirty tracker at this moment; the alias itself is plain memory
     vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 1);
+    if (!v->shi || from < v->slo) v->slo = from;   // the guest pages this pool's runs show (nvn_vpool_src_covers): only ever widened
+    if (from + r->size > v->shi) v->shi = from + r->size;
     uint64_t end = (uint64_t)r->voff + r->size;
     if (end >> 27 > v->top >> 27) LOG("[nvn] virtual pool %p: mapped up to %#llx (%d runs)", (const void *)v->pool, (unsigned long long)end, v->nrun);
     if (end > v->top) v->top = end;
@@ -2591,6 +2654,30 @@ int nvn_sparse_alias(uint64_t lo, uint64_t hi) {
     for (int k = 0; k < g_nvp && !r; k++) { const struct vpool *v = g_vp[k];
         uint64_t base = (uint64_t)(uintptr_t)v->base;
         r = lo < base + v->len && base < hi;
+    }
+    pthread_mutex_unlock(&g_vp_mu); return r;
+}
+// Whether a live run of a sparse virtual pool maps guest pages in [lo, hi), for DM_GUEST_FILE's hole punching (hle_svc.c's UnmapPhysicalMemory, through nvn_mtl.m's veto): a run is a
+// vm_remap of a physical pool's pages with copy FALSE (vpool_map), which shares them, so a hole punched under it would zero what the run still shows the GPU. The run table holds the
+// virtual ranges, the page table the guest page behind each 4 KB of them (vpt_set writes it from the same request, before the remap). A request kept in the page table only (not aligned
+// to the host page, or past the reservation) maps nothing: inside a run it only changes the entry of a page the run still shows from its earlier request, bytes NVN no longer maps there,
+// which a punch leaves no more wrong. A pool whose run table was once full (lost) has its whole reservation looked at. → 1 as well when it cannot tell without waiting.
+// Lock order: the callers hold g_map_lock, and nvn_mtl.m's veto may hold g_mu, while g_mu is taken under g_vp_mu (vrun_set and vpool_drop through mtl_pool_add / mtl_pool_del, which
+// may also sleep up to about 1.5 s retrying a refused no-copy buffer): waiting for g_vp_mu there could deadlock or stall every guest memory call, so it is only tried, and a held one
+// answers 1. Nothing under g_vp_mu takes g_map_lock (hle_svc.c's own, taken only by the guest's memory calls, svc_nro_deactivate and its diagnostic threads); this takes no other lock
+int nvn_vpool_src_covers(uintptr_t lo, uintptr_t hi) {
+    if (hi <= lo) return 0;
+    if (pthread_mutex_trylock(&g_vp_mu)) return 1;
+    int r = 0;
+    for (int k = 0; k < g_nvp && !r; k++) { const struct vpool *v = g_vp[k];
+        if (lo >= v->shi || hi <= v->slo) continue;   // none of its runs was ever remapped from [lo, hi) (shi 0: no run yet)
+        uint64_t end = v->len < v->size ? v->len : v->size;
+        for (int i = 0; i < (v->lost ? 1 : v->nrun) && !r; i++)
+            for (uint64_t o = v->lost ? 0 : v->run[i].lo, e = v->lost ? end : v->run[i].hi; o < e && o < v->size && !r; o += 0x1000) {
+                if (lo >= v->pb[o >> 21].hi || hi <= v->pb[o >> 21].lo) { o |= (2u << 20) - 1; o -= 0xFFF; continue; }   // no entry of this leaf was ever mapped from [lo, hi) (hi 0: a leaf never mapped): skip its 2 MB
+                const vpte *p = vpt_get(v, o);
+                r = p && p->phys && (uintptr_t)p->phys < hi && (uintptr_t)p->phys + 0x1000 > lo;
+            }
     }
     pthread_mutex_unlock(&g_vp_mu); return r;
 }
