@@ -35,6 +35,7 @@ static _Atomic uint64_t *g_alias_bits;   // alias region page bitmap (alias_page
 static uint64_t *g_alias_exposed;   // one bit per host page ever opened; protected by g_map_lock
 static uint8_t *g_stack; static size_t g_stack_cap;
 static size_t g_app_pool;          // the application memory pool the game is told: the profile's app_pool, or DM_APP_POOL
+static int g_map_limit;            // MapPhysicalMemory limited to that pool and the alias region's pages counted as used memory: the profile's mem_map_limit, or DM_MEM_MAP_LIMIT=0/1 (mem_init)
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < g_reserve; }
 
@@ -471,6 +472,12 @@ static void mem_init_once(void) {
     if ((v = env_size("DM_HEAP_REGION", 0x10000000, pg))) heap = v;
     g_app_pool = DM_GAME_APP_POOL;
     if ((v = env_size("DM_APP_POOL", 0x10000000, 0x100000))) g_app_pool = v;
+    // DM_MEM_MAP_LIMIT=1 / 0: the profile's mem_map_limit on or off without a rebuild (MapPhysicalMemory below). Mario Kart World's SDK keeps the pages the game frees mapped:
+    // without the limit the alias region's total only grows (1.25 to 2.25 GB over four races on the phone, 3 GB after 11 minutes on the main menu), as dirty guest file pages
+    g_map_limit = DM_GAME_MEM_MAP_LIMIT;
+    const char *ml = getenv("DM_MEM_MAP_LIMIT");
+    if (ml && (!strcmp(ml, "0") || !strcmp(ml, "1"))) g_map_limit = *ml == '1';
+    else if (ml) LOG("[RED] [mem] DM_MEM_MAP_LIMIT=%s: not 0 or 1, the profile's mem_map_limit (%s) stays", ml, DM_GAME_MEM_MAP_LIMIT ? "on" : "off");
     g_reserve = 0x10000000 + alias + DM_GAME_MEM_STACK + heap;   // the profile's RESERVE when nothing is set
     const char *vp = getenv("DM_VA_PROBE");
     if (vp && *vp == '1') LOG("[mem] address space: one block of up to %.2f GB can be reserved (DM_VA_PROBE)", va_probe() / 1073741824.0);
@@ -493,10 +500,11 @@ static void mem_init_once(void) {
     if (!(g_alias_bits = calloc((g_alias_cap >> 18) + 1, sizeof *g_alias_bits))) die("alias region page bitmap calloc");
     if (!(g_alias_exposed = calloc(g_alias_cap / pg / 64 + 1, sizeof *g_alias_exposed))) die("alias exposure bitmap calloc");
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)g_reserve, g_heap, g_alias, g_stack);
-    LOG("[mem] guest block %.2f GB: alias region %.2f GB%s, stacks %.2f GB, heap region %.2f GB%s; application pool %.2f GB%s", g_reserve / 1073741824.0,
+    LOG("[mem] guest block %.2f GB: alias region %.2f GB%s, stacks %.2f GB, heap region %.2f GB%s; application pool %.2f GB%s, maps %s%s", g_reserve / 1073741824.0,
         g_alias_cap / 1073741824.0, alias != DM_GAME_MEM_ALIAS ? " (DM_ALIAS_SIZE)" : "", g_stack_cap / 1073741824.0,
         g_heap_cap / 1073741824.0, g_heap_cap != RESERVE - 0x10000000 - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK ? " (DM_HEAP_REGION)" : "",
-        g_app_pool / 1073741824.0, g_app_pool != DM_GAME_APP_POOL ? " (DM_APP_POOL)" : "");
+        g_app_pool / 1073741824.0, g_app_pool != DM_GAME_APP_POOL ? " (DM_APP_POOL)" : "",
+        g_map_limit ? "limited to the pool" : "not limited", g_map_limit != DM_GAME_MEM_MAP_LIMIT ? " (DM_MEM_MAP_LIMIT)" : "");
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
     const char *rf = getenv("DM_REGIONS");
@@ -920,7 +928,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
         uint64_t charged = (uint64_t)DM_GAME_MEM_USED + big_bss_bytes() + atomic_load(&g_alias_mapped);
-        if (DM_GAME_MEM_MAP_LIMIT && (charged > APP_POOL || size > APP_POOL - charged)) {
+        if (g_map_limit && (charged > APP_POOL || size > APP_POOL - charged)) {
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
         int rc = 0;
@@ -1065,8 +1073,8 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // Pokémon Legends: Z-A's nninitStartup allocates and frees everything allocatable (pool − 64 MB, mapped at the top of its StandardAllocator region: 12 GB, 4 GB after the cut in its patches.py); the SDK keeps the freed pages mapped
         // and maps new ones for later allocations, until a map fails: then it unmaps the cached block and retries (measured on the Mac: the refused 4 MB map at +0x43e2c000 was followed by
         // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
-        // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
-        if (DM_GAME_MEM_MAP_LIMIT && num == 0x2C) {
+        // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports. DM_MEM_MAP_LIMIT=0/1 overrides the profile (mem_init)
+        if (g_map_limit && num == 0x2C) {
             int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);
             if (need && need > room) {
                 pthread_mutex_unlock(&g_map_lock);
@@ -1137,7 +1145,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_UsedMem:  case I_UsedNonSys:  pthread_mutex_lock(&g_map_lock);
                                              v = g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes();   // profile mem_used, 64 MB unless the game needs more (see mem_used in dm/games/README.md)
                                              // with mem_map_limit, the pages mapped in the alias region count too, as on Horizon (the limit in MapPhysicalMemory is the pool less this)
-                                             if (DM_GAME_MEM_MAP_LIMIT) v += (uint64_t)atomic_load(&g_alias_mapped);
+                                             if (g_map_limit) v += (uint64_t)atomic_load(&g_alias_mapped);
                                              pthread_mutex_unlock(&g_map_lock); break;
         // the system resource the NPDM declares (profile sys_resource; 32 MB without the key). The SDK's IsVirtualAddressMemoryEnabled is "total != 0": Big Brain Academy's nninitStartup
         // asks StandardAllocator for 60 GB of virtual address memory when it is, and sets a heap only when it is not (its NPDM declares none)

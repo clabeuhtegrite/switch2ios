@@ -24,6 +24,9 @@ DM_MEMSTAT_WALK_EVERY=10
 # Texture views: a texture whose 4 cached views are all taken gets more places, up to 64 (docs/ios.md). On the menus the cache reused no view, so every view was made again,
 # and malloc grew about 300 MB on the phone (test 3) until the screen changed
 DM_NVN_VC_WAYS=64
+# MapPhysicalMemory limited to the application pool, as on the console (docs/ios.md): the system library then gives back the freed pages it keeps mapped, instead of the alias
+# region growing from 1.25 to 2.25 GB over four races (test 5). Off until a Mac run with the game
+#DM_MEM_MAP_LIMIT=1
 # No pipeline warm-up (part M ran without it): about 214 MiB less at the peak and no 70 s of preparation at the start; pipelines are built when first drawn instead
 DM_PSO_MANIFEST=off
 # The guest memory layout for a phone, from the measuring runs on the Mac (docs/ios.md, "Fitting into a phone's memory"). Unset, the profile's 20 GB block is reserved, which only an
