@@ -314,6 +314,13 @@ static void res_top_once(NSError *err) {
     if (now - atomic_load(&since) > 60000000000ull) { atomic_store(&since, now); atomic_store(&fails, 0); }
     if (atomic_fetch_add(&fails, 1) >= 32) MDIE("the GPU is out of memory: 32 command buffers failed within a minute (GPU allocated %llu MB, recommended working set %llu MB)", (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20));
 }
+// The error of a command buffer committed outside the paths that report theirs (the indirect-count multi-draw's wait, the present snapshots), which went unlogged: after a GPU
+// recovery on an iPhone in Mario Kart World (4 Nov) the log had 28 "InnocentVictim" errors and no culprit, and these two commit without a feedback handler. At most 8 lines
+static void cb_error_note(const char *what, uint64_t frame, NSError *err) {
+    if (!err) return;
+    atomic_store(&g_last_commit_error, 1); res_top_once(err);
+    static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) MLOG("[RED] %s command buffer execution error (frame %llu): %s", what, (unsigned long long)frame, err.description.UTF8String);
+}
 // Since the last call: residency commits (count, time), additions by source line (count, MB; the four largest by bytes) and removals
 void mtl_res_stats(char *out, size_t n) {
     pthread_mutex_lock(&g_res_mu);
@@ -11126,7 +11133,9 @@ static void mdi_wait(void) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush(); res_commit();
     [g_cb endCommandBuffer];
-    rec_commit(g_cb, nil);
+    MTL4CommitOptions *o = [MTL4CommitOptions new]; uint64_t f = atomic_load(&g_cur_frame);
+    [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) { cb_error_note("indirect-count multi-draw wait", f, cb.error); }];
+    rec_commit(g_cb, o);
     if (!g_mdi_ev) g_mdi_ev = [g_dev newSharedEvent];
     rec_signal(g_mdi_ev, ++g_mdi_v); rec_drain();
     uint64_t w0 = ws_t0(); int ok = [g_mdi_ev waitUntilSignaledValue:g_mdi_v timeoutMS:10000]; if (ws_on()) ws_put(WS_MDI, w0, 1);
@@ -14226,15 +14235,17 @@ static uint64_t snap_take(const tex_t *t) {
     [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next writes to its texture come after the copy
     [ce endEncoding]; [cb endCommandBuffer];
     uint64_t v = ++g_snap_v;
+    MTL4CommitOptions *o = [MTL4CommitOptions new]; uint64_t f = atomic_load(&g_cur_frame);
+    [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { cb_error_note("present snapshot", f, fb.error); }];
     if (rec_on() && g_rb_started) {   // a block of the encode thread's queue, behind the frame's work (see above)
         if (on_sub_thread()) rec_publish();   // what the submitting thread recorded outside a submission goes first
         rec_blk *b = rec_own_begin();
-        rec_t *r = rec_own_put(b, RO_COMMIT_REAL, 2); r->a[0] = 0; r->a[1] = rec_obj(cb);
+        rec_t *r = rec_own_put(b, RO_COMMIT_REAL, 2); r->a[0] = rec_obj(o); r->a[1] = rec_obj(cb);
         r = rec_own_put(b, RO_SIGNAL, 1); r->a[0] = rec_obj(g_snap_ev); r->a[1] = v;
         r = rec_own_put(b, RO_NOTE, 0); r->a[0] = (uint64_t)(uintptr_t)&g_snap_cmt; r->a[1] = v;
         rec_own_push(b);
     } else {
-        pthread_mutex_lock(&g_res_mu); [g_q4 commit:&cb count:1]; [g_q4 signalEvent:g_snap_ev value:v]; pthread_mutex_unlock(&g_res_mu);
+        pthread_mutex_lock(&g_res_mu); [g_q4 commit:&cb count:1 options:o]; [g_q4 signalEvent:g_snap_ev value:v]; pthread_mutex_unlock(&g_res_mu);
         atomic_store(&g_snap_cmt, v);
     }
     g_snap[k].ev = v;
