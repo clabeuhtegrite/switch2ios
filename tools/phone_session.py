@@ -19,11 +19,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The default plan (Mario Kart World, a test of the iPhone app after a memory fix for the menus): start, name, what to do
+# The default plan (Mario Kart World, a test of the iPhone app after a memory fix for the menus): start, name, what to do.
+# 'menu 1' is the Grand Prix class screen, where the Mac's malloc used to climb about 3 MiB/s (run A) and stayed flat with DM_NVN_VC_WAYS=64 (run C1).
 PLAN = [
     ('0:00', 'lancement', "Le jeu se lance. Ne touche à rien jusqu'à l'écran titre."),
-    ('1:00', 'menu 1', "Va jusqu'à l'écran de choix du personnage du Grand Prix (titre, puis A jusqu'au choix du personnage), et ne touche plus à rien pendant 3 minutes."),
-    ('4:00', 'course 1', "Choisis ton personnage, lance le Grand Prix et joue la première course jusqu'au bout."),
+    ('1:00', 'menu 1', "Passe l'écran titre, choisis Grand Prix et arrête-toi sur le choix de la cylindrée (50cc, 100cc, 150cc). Ne touche plus à rien pendant 3 minutes."),
+    ('4:00', 'course 1', "Choisis la cylindrée, ton personnage et une coupe, puis joue la première course jusqu'au bout."),
     ('8:00', 'menu 2', "Course finie : reste sur l'écran de fin de course ou le menu qui suit, sans toucher à rien, pendant 3 minutes."),
     ('11:00', 'balade', "Quitte vers le menu principal et pars en balade libre : roule partout pendant 3 minutes."),
     ('14:00', 'fin', "C'est fini : ferme le jeu, puis dépose log.txt et memstat.tsv à la racine d'iCloud Drive."),
