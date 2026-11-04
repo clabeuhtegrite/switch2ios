@@ -13230,9 +13230,12 @@ static mk_pool *mk_pools(int *n, uintptr_t **bufs) {
     *n = np; *bufs = b; return p;
 }
 static int mk_range_cmp(const void *a, const void *b) { uintptr_t x = ((const mk_pool *)a)->lo, y = ((const mk_pool *)b)->lo; return (x > y) - (x < y); }
-int mtl_mem_kinds(uint64_t *out, int n) { @autoreleasepool {
+// full 0: only Metal's allocated size and the pipeline count, read without a lock or a walk (memstat's rows between two region walks, DM_MEMSTAT_WALK_EVERY): the rest walks
+// the pool table, the serial table, the guest pages of every pool (mincore) and the residency set, about 0.3 s a row on an iPhone in Mario Kart World's free roam
+int mtl_mem_kinds(uint64_t *out, int n, int full) { @autoreleasepool {
     uint64_t k[MK_N] = {0};
-    if (g_dev) {
+    if (g_dev && !full) { k[MK_ALLOC] = g_dev.currentAllocatedSize; k[MK_PSO] = (uint64_t)g_pso.n + g_pso_nx2.n + g_pso_hy.n + g_cps.n + g_pbase.n; }
+    else if (g_dev) {
         int np = 0, nk = 0; uintptr_t *pb = NULL; mk_pool *pp = mk_pools(&np, &pb); uintptr_t *pk = mk_pkg_textures(&nk);
         for (int i = 0; i < np; i++) { k[MK_POOL_ALL] += pp[i].len; if (pp[i].res) k[MK_POOL_RES] += pp[i].len; }
         // Guest pages in the pools: the ranges merged first (a virtual pool's runs and the pools beside one another share host pages), then mincore over each

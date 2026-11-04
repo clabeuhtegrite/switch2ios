@@ -30,7 +30,7 @@ void svc_guest_range(uint8_t **base, size_t *size);
 int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have
 // nvn_mtl.m: Metal's memory by kind (mtl_mem_kinds: pools resident, all pools, packaged textures, other textures, heaps, other buffers, allocated, guest in pools, pipelines) and
 // every resident allocation one per line (mtl_mem_textures); a host built without the NVN layer has neither
-__attribute__((weak)) int mtl_mem_kinds(uint64_t *out, int n) { (void)out; (void)n; return 0; }
+__attribute__((weak)) int mtl_mem_kinds(uint64_t *out, int n, int full) { (void)out; (void)n; (void)full; return 0; }
 __attribute__((weak)) void mtl_mem_textures(FILE *f) { (void)f; }
 enum { C_GUEST, C_CODE, C_MALLOC, C_GPU, C_STACK, C_FILE, C_OTHER, NC };
 static const char *k_cls[NC] = {"guest", "code", "malloc", "gpu", "stack", "file", "other"};
@@ -74,7 +74,8 @@ static void dump_regions(const char *path) {
 static pthread_mutex_t g_ms_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(FILE *) g_ms_file;
 
-// One row. With walk 0 the region walk is left out (DM_MEMSTAT_WALK_EVERY, memstat_thread) and the columns it gives (the classes, charged total, unattributed, guest_dirty) read "-".
+// One row. With walk 0 the region walk is left out (DM_MEMSTAT_WALK_EVERY, memstat_thread) and the columns it gives (the classes, charged total, unattributed, guest_dirty) read "-",
+// and so do Metal's memory by kind but the pipeline count, whose walks (mtl_mem_kinds) cost as much again.
 // Everything is read before g_ms_mu is taken, so a mark never waits for the walk or for Metal. Returns what taking the sample took in ms (sample_ms), the writing left out, and in *walk_ms what the region walk took of it
 static double sample(FILE *f, double t, id<MTLDevice> dev, int walk, double *walk_ms) {
     uint64_t s0 = now_ns(), th0 = g_t0_ns;   // th0: the host's start (main.c host_preload), 0 until it is set (on iOS memstat starts before it)
@@ -107,7 +108,7 @@ static double sample(FILE *f, double t, id<MTLDevice> dev, int walk, double *wal
     }
     *walk_ms = (now_ns() - w0) / 1e6;
     uint64_t sum = 0; for (int c = 0; c < NC; c++) sum += bill[c];
-    uint64_t mtl = dev.currentAllocatedSize, mk[9] = {0}; mtl_mem_kinds(mk, 9);   // Metal by kind (all 0 without the NVN layer); mk[6] repeats currentAllocatedSize, which metal_alloc (mtl) already gives
+    uint64_t mtl = dev.currentAllocatedSize, mk[9] = {0}; mtl_mem_kinds(mk, 9, walk);   // Metal by kind (all 0 without the NVN layer; with walk 0 the pipeline count only); mk[6] repeats currentAllocatedSize, which metal_alloc (mtl) already gives
     struct rusage_info_v4 ru; int ru_ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
     static mach_port_t host; if (!host) host = mach_host_self();   // one send right, kept: each mach_host_self() adds a reference to it
     vm_statistics64_data_t hs; mach_msg_type_number_t hn = HOST_VM_INFO64_COUNT;
@@ -126,7 +127,9 @@ static double sample(FILE *f, double t, id<MTLDevice> dev, int walk, double *wal
         for (int c = 0; c < NC; c++) fprintf(f, "\t%llu/%llu/%llu", virt[c] >> 20, res[c] >> 20, bill[c] >> 20);
         fprintf(f, "\t%llu\t%lld", sum >> 20, ((int64_t)fp - (int64_t)sum) >> 20);
     } else for (int c = 0; c < NC + 2; c++) fputs("\t-", f);   // the NC classes, charged total, unattributed
-    fprintf(f, "\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu", mk[0] >> 20, mk[1] >> 20, mk[2] >> 20, mk[3] >> 20, mk[4] >> 20, mk[5] >> 20, mk[7] >> 20, mk[8]);
+    if (walk) fprintf(f, "\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu", mk[0] >> 20, mk[1] >> 20, mk[2] >> 20, mk[3] >> 20, mk[4] >> 20, mk[5] >> 20, mk[7] >> 20);
+    else for (int i = 0; i < 7; i++) fputs("\t-", f);   // pools_resident .. guest_in_pools
+    fprintf(f, "\t%llu", mk[8]);
     // The guest file and the disk, the process since launch, the whole system, the sample's cost and the host's clock (the header line says the units); "-" where there was nothing to read
     fprintf(f, "\t%llu", vi.external >> 20);
     if (walk) fprintf(f, "\t%llu", gdirty >> 20); else fputs("\t-", f);
@@ -157,8 +160,8 @@ void memstat_note(const char *line) {
     pthread_mutex_unlock(&g_ms_mu);
 }
 
-// DM_MEMSTAT_WALK_EVERY=<n> (default 1: every sample): while samples take over 5 ms, the region walk runs only every n samples, its columns reading "-" in between, and the rest is still read every
-// second. The walk (vm_region_recurse_64, VM_REGION_SUBMAP_INFO_64) counts the pages of every region one by one and may hold the task's map and each region's object locked meanwhile;
+// DM_MEMSTAT_WALK_EVERY=<n> (default 1: every sample): while samples take over 5 ms, the region walk and Metal's memory by kind run only every n samples, their columns reading "-" in between,
+// and the rest is still read every second. The walk (vm_region_recurse_64, VM_REGION_SUBMAP_INFO_64) counts the pages of every region one by one and may hold the task's map and each region's object locked meanwhile;
 // with the guest in a file every guest region maps a large file object (the one file's, or with DM_GUEST_FILE_CHUNK the one of the file that holds it), whose pages it then counts across the whole block, and the game's page faults and mprotect calls on it wait.
 // A [RED] line says when a sample first takes over 5 ms
 static void *memstat_thread(void *p) {
@@ -177,7 +180,7 @@ static void *memstat_thread(void *p) {
     uint64_t t0 = now_ns();
     const char *ds = getenv("DM_MEMSTAT_DUMP"); int dump_at = ds ? atoi(ds) : -1;
     const char *we = getenv("DM_MEMSTAT_WALK_EVERY"); int every = we && atoi(we) > 1 ? atoi(we) : 1, skipped = 0, slow = 0, warned = 0;   // slow: the last walk's sample took over 5 ms
-    if (every > 1) LOG("[mem] memstat: while samples take over 5 ms, the region walk runs every %d samples, the rest every second (DM_MEMSTAT_WALK_EVERY)", every);
+    if (every > 1) LOG("[mem] memstat: while samples take over 5 ms, the region walk and Metal's memory by kind run every %d samples, the rest every second (DM_MEMSTAT_WALK_EVERY)", every);
     char dp[1100], tp[1100]; snprintf(dp, sizeof dp, "%s.regions", (const char *)p); snprintf(tp, sizeof tp, "%s.textures", (const char *)p);
     for (int sec = 0;; sec++) {
         int walk = every == 1 || !slow || ++skipped >= every;

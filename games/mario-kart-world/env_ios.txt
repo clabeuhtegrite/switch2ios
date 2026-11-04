@@ -19,7 +19,7 @@ DM_GUEST_FILE=1
 # file, had 18 of 54-519 ms). tools/nocopy_cross.m passed on that Mac, and pools across two files were made as usual
 DM_GUEST_FILE_CHUNK=1G
 # memstat's region walk took about 270 ms a sample with 20 files on the Mac and may hold the task's memory map meanwhile: while samples take over 5 ms, it runs every 10 samples
-# (the class columns read - in between), the rest every second
+# (the class columns read - in between), the rest every second. Metal's memory by kind follows it (on the phone, test 4: 270 ms a sample without the walk, 359 with it)
 DM_MEMSTAT_WALK_EVERY=10
 # Texture views: a texture whose 4 cached views are all taken gets more places, up to 64 (docs/ios.md). On the menus the cache reused no view, so every view was made again,
 # and malloc grew about 300 MB on the phone (test 3) until the screen changed
