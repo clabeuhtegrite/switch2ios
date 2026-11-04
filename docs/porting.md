@@ -95,6 +95,7 @@ All of these are host switches (`./switch2mac.py run VAR=value ...`). While the 
 | `DM_PROBE=main:<off>[@reg+off]` + `DM_PROBE_LIMIT`, `probewin <frames>` (ctl) | log registers (and memory) each time the game reaches an address |
 | `DM_PROBE_WATCH=<addr>+<n>`, `readwatch <addr> <bytes>` (ctl) | who writes / reads guest memory (`pc` + backtrace) |
 | `memdump <addr> <bytes> <file>` (ctl) | raw guest memory |
+| `mark <label>` (ctl) | `[mark] <label> t=<seconds> s` in the log, and a `# mark` line in the memory statistics (`DM_MEMSTAT`): one moment found in both |
 | `DM_GPUW_LOG=1` | each distinct GPU writer (storage-buffer writes with shader key, copies, fills), once |
 | `DM_GPU_READWATCH=1` | the CPU code that reads GPU results |
 | `DM_NVN_GPUPROF=every:600` + `nxnative/dm/tools/gpuprof.py` | GPU time per pass |
