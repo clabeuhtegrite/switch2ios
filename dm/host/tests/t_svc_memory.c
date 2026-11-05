@@ -470,6 +470,17 @@ static void file_rule(void) {
     assert(!guest_file_wanted(NULL, pool9, 0));   // no limit known: the Mac
     assert(!guest_file_wanted("0", pool9, 8 * G) && guest_file_wanted("1", pool3, 12 * G) && guest_file_wanted("1", pool3, 0));
 }
+// The free space DM_GUEST_FILE_MIN_FREE takes: f_bavail when that is not under the threshold, otherwise the capacity for important use when it is larger, never less than f_bavail
+static void file_free(void) {
+    char was[sizeof g_gf_dir]; memcpy(was, g_gf_dir, sizeof was);   // the files' folder when the guest is in files (memory-file)
+    if (!g_gf_dir[0]) assert(confstr(_CS_DARWIN_USER_TEMP_DIR, g_gf_dir, sizeof g_gf_dir));
+    struct statfs fs; assert(!statfs(g_gf_dir, &fs));
+    double f = (double)fs.f_bavail * fs.f_bsize, b = -1;
+    assert(guest_file_free(&fs, 0, &b) == f && b == f);   // not under the threshold: f_bavail, the capacity not asked
+    assert(guest_file_free(&fs, 1e18, &b) >= f && b == f);   // under it: the larger figure
+    g_gf_dir[0] = 0; assert(guest_file_important() < 0);   // no folder: unreadable
+    memcpy(g_gf_dir, was, sizeof was);
+}
 static void heap_regrow(void) {
     assert(!resize(4 * 1024 * 1024));
     memset((void *)(heap + 3 * 1024 * 1024), 0x5a, P);
@@ -552,7 +563,7 @@ int main(int argc, char **argv) {
     if (!getenv("DM_ALIAS_SIZE")) assert(info(I_AliasSize) == SWITCH_ALIAS);   // the Mac's alias region is a Switch's, whatever the profile can give an iPhone; DM_ALIAS_SIZE=<mem_alias> runs these tests on an iPhone's
 #endif
     layout_order();
-    lazy_commit(); alias_lifecycle(); ownership(); module_sources(); module_back_patch(); failures(); release_fallback(); file_rule(); heap_regrow(); concurrency(); fragmented_queries();
+    lazy_commit(); alias_lifecycle(); ownership(); module_sources(); module_back_patch(); failures(); release_fallback(); file_rule(); file_free(); heap_regrow(); concurrency(); fragmented_queries();
     guest_helper();
     if (!DM_GAME_MEM_MAP_LIMIT) metadata_limit();
 #ifdef TEST_REAL_DIRTY

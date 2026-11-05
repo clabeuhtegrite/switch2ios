@@ -14,6 +14,7 @@
 #include <stdatomic.h>
 #include <mach/mach.h>
 #include <TargetConditionals.h>
+#include <CoreFoundation/CoreFoundation.h>   // the guest files' volume (guest_file_important)
 #if TARGET_OS_IPHONE
 #include <os/proc.h>   // os_proc_available_memory
 #endif
@@ -75,26 +76,62 @@ int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h,
 static int g_gf_tab[GF_MAX];       // the files, open for reading and writing
 static int g_gf_n;                 // how many; 0 while the guest is anonymous. Set by mem_init_once, whose pthread_once orders it before every reader
 static uint64_t g_gf_min_free;     // DM_GUEST_FILE_MIN_FREE in bytes: the free space on the files' disk under which the game is stopped; 0 = never
+static char g_gf_dir[1024];        // the files' folder, whose volume guest_file_important asks; set before they are made
+
+// The capacity for important use of the files' volume in bytes (kCFURLVolumeAvailableCapacityForImportantUsageKey, of their folder), or -1 when it cannot be read: the free space with what the
+// system would purge for such a write (caches, local copies of files kept in iCloud and the like), which statfs's f_bavail leaves out. It is the figure an iPhone's Settings show; the system
+// works it out, and it can take time, so it is asked only when f_bavail is low (guest_file_free, guest_file_thread). On a 12 GB iPhone whose Settings showed 46.97 GB free, f_bavail gave
+// 2.7 GB, under the 5 GB minimum
+static double guest_file_important(void) {
+    if (!g_gf_dir[0]) return -1;
+    CFURLRef u = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const UInt8 *)g_gf_dir, (CFIndex)strlen(g_gf_dir), true);
+    if (!u) return -1;
+    CFTypeRef v = NULL; long long b = -1;
+    if (CFURLCopyResourcePropertyForKey(u, kCFURLVolumeAvailableCapacityForImportantUsageKey, &v, NULL) && v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+        if (!CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, &b)) b = -1;
+    }
+    if (v) CFRelease(v);
+    CFRelease(u);
+    return b < 0 ? -1 : (double)b;
+}
+// The free space on the files' volume in bytes, as DM_GUEST_FILE_MIN_FREE and the lines take it: f_bavail, or the capacity for important use when f_bavail is under want and that is larger
+// (guest_file_important). *bavail, when given, gets f_bavail's own figure
+static double guest_file_free(const struct statfs *fs, double want, double *bavail) {
+    double b = (double)fs->f_bavail * fs->f_bsize, imp = b < want ? guest_file_important() : -1;
+    if (bavail) *bavail = b;
+    return imp > b ? imp : b;
+}
 
 // Every second the free space on the files' disk (they all lie on one volume): under DM_GUEST_FILE_MIN_FREE the game is stopped (exit code 87; the memory watchdog's is 86, hle_nvn.c), before a full
-// disk leaves the kernel no room to write the guest's pages out, nor a phone's system any room. Every 10th second one line, [RED] under 2 GB free: what the disk cost so far and the footprint's parts
+// disk leaves the kernel no room to write the guest's pages out, nor a phone's system any room. Every 10th second one line, [RED] under 2 GB free: what the disk cost so far and the footprint's parts.
+// The free space is f_bavail, or while that is under the minimum the capacity for important use when it is larger (guest_file_free)
 static void *guest_file_thread(void *arg) {
     (void)arg; const double G = 1073741824.0;
+    double imp = -1, imp_b = 0; unsigned imp_sec = 0;   // the last capacity for important use (-1: unreadable), f_bavail then, in bytes, and the second it was asked at (0: not yet)
     for (unsigned sec = 1;; sec++) {
         sleep(1);
         struct statfs fs; struct rusage_info_v4 ru; task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT; struct stat st;
-        int fs_ok = !fstatfs(g_gf_tab[0], &fs); double avail = fs_ok ? (double)fs.f_bavail * fs.f_bsize / G : -1, held = 0;
-        if (fs_ok && g_gf_min_free && (uint64_t)fs.f_bavail * fs.f_bsize < g_gf_min_free) {
-            LOG("[RED] [mem] guest file: %.1f GB free on its disk, under %.1f: stopping the game (the free space statfs gives, f_bavail, which leaves out space the system could purge)", avail, g_gf_min_free / G);
-            _exit(87);
+        int fs_ok = !fstatfs(g_gf_tab[0], &fs); double b = fs_ok ? (double)fs.f_bavail * fs.f_bsize : -1, room = b, held = 0;
+        if (fs_ok && g_gf_min_free && b < (double)g_gf_min_free) {
+            // f_bavail is under the minimum: the capacity for important use counts too, asked again every 10 s, and at once when the last figure, lowered by what f_bavail lost since,
+            // is under the minimum, so that a stop rests on a fresh one
+            double est = imp >= 0 ? imp - (imp_b > b ? imp_b - b : 0) : -1;
+            if (!imp_sec || sec - imp_sec >= 10 || (est >= 0 && est < (double)g_gf_min_free)) { imp = est = guest_file_important(); imp_b = b; imp_sec = sec; }
+            if (est > room) room = est;
+            if (room < (double)g_gf_min_free) {
+                LOG("[RED] [mem] guest file: %.1f GB free on its disk (f_bavail %.1f; capacity for important use %.1f, -1 when unreadable), under %.1f: stopping the game", room / G, b / G, imp >= 0 ? imp / G : -1, g_gf_min_free / G);
+                _exit(87);
+            }
         }
         if (sec % 10) continue;
+        double avail = fs_ok ? room / G : -1; char fb[40] = "";
+        if (room > b) snprintf(fb, sizeof fb, " (f_bavail %.1f)", b / G);
         for (int i = 0; i < g_gf_n; i++) if (!fstat(g_gf_tab[i], &st)) held += st.st_blocks * 512.0;
         int ru_ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
-        LOG("%s[mem] guest file: %.2f GB allocated on disk; process read %.2f GB, %llu page-ins, logical writes %.2f GB; footprint %.2f GB (internal %.2f, compressed %.2f, peak so far %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk",
+        LOG("%s[mem] guest file: %.2f GB allocated on disk; process read %.2f GB, %llu page-ins, logical writes %.2f GB; footprint %.2f GB (internal %.2f, compressed %.2f, peak so far %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk%s",
             avail >= 0 && avail < 2 ? "[RED] " : "", held / G, ru_ok ? ru.ri_diskio_bytesread / G : -1, ru_ok ? (unsigned long long)ru.ri_pageins : 0ull,
-            ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, ru_ok ? ru.ri_lifetime_max_phys_footprint / G : -1, vi.external / G, avail);
+            ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, ru_ok ? ru.ri_lifetime_max_phys_footprint / G : -1, vi.external / G, avail, fb);
     }
     return NULL;
 }
@@ -133,7 +170,7 @@ static int guest_file_class(int fd, char *why, size_t nwhy) {
 }
 #endif
 // The block in files of chunk bytes, the last one holding the rest: 1 with the files in g_gf_tab and mapped; 0 with why filled in, every file closed and the whole block anonymous PROT_NONE again, as reserved
-static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *fs, char *why, size_t nwhy) {
+static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *fs, double *disk_free, char *why, size_t nwhy) {
     const double G = 1073741824.0; char path[1100]; int made = 0, ok = 1;
     const char *sep = dir[0] && dir[strlen(dir) - 1] == '/' ? "" : "/";
     for (int k = 0; ok && k < n; k++) {
@@ -152,7 +189,8 @@ static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *
 #else
         uint64_t want = g_gf_min_free + ((uint64_t)8 << 30);
 #endif
-        if ((uint64_t)fs->f_bavail * fs->f_bsize < want) { snprintf(why, nwhy, "%.1f GB free on their disk, under %.1f", (double)fs->f_bavail * fs->f_bsize / G, want / G); ok = 0; }
+        double fb; *disk_free = guest_file_free(fs, (double)want, &fb);
+        if (*disk_free < (double)want) { snprintf(why, nwhy, "%.1f GB free on their disk (f_bavail %.1f), under %.1f", *disk_free / G, fb / G, want / G); ok = 0; }
     }
     for (int k = 0; ok && k < n; k++) {
         size_t sz = k == n - 1 ? g_reserve - (size_t)k * chunk : chunk; uint8_t *at = g_as + (size_t)k * chunk;
@@ -177,12 +215,14 @@ static void guest_file_init(void) {
     g_gf_min_free = mf && *mf ? env_size("DM_GUEST_FILE_MIN_FREE", 0, 0x100000) : (uint64_t)5 << 30;
     size_t chunk = env_size("DM_GUEST_FILE_CHUNK", (size_t)64 << 20, 0x100000); if (!chunk) chunk = (size_t)1 << 30;
     if ((g_reserve + chunk - 1) / chunk > GF_MAX) chunk = ((g_reserve + GF_MAX - 1) / GF_MAX + 0xfffff) & ~(size_t)0xfffff;
-    int n = (int)((g_reserve + chunk - 1) / chunk); char dir[1024] = "", why[1400]; struct statfs fs;
+    int n = (int)((g_reserve + chunk - 1) / chunk); char dir[1024] = "", why[1400], fb[40] = ""; struct statfs fs; double disk_free = 0;
     if (d && *d) snprintf(dir, sizeof dir, "%s", d);
     else if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: no temporary folder, errno %d)", errno); return; }
-    if (!guest_files_map(dir, chunk, n, &fs, why, sizeof why)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: %s)", why); return; }
+    snprintf(g_gf_dir, sizeof g_gf_dir, "%s", dir);
+    if (!guest_files_map(dir, chunk, n, &fs, &disk_free, why, sizeof why)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: %s)", why); return; }
     g_gf_n = n;
-    LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on the %s volume, %.1f GB free on it", n, chunk / G, dir, g_reserve / G, fs.f_fstypename, (double)fs.f_bavail * fs.f_bsize / G);
+    if (disk_free > (double)fs.f_bavail * fs.f_bsize) snprintf(fb, sizeof fb, " (f_bavail %.1f)", (double)fs.f_bavail * fs.f_bsize / G);
+    LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on the %s volume, %.1f GB free on it%s", n, chunk / G, dir, g_reserve / G, fs.f_fstypename, disk_free / G, fb);
     if (strcmp(fs.f_fstypename, "apfs") || !(fs.f_flags & MNT_LOCAL)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
     pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
     if (!rc) pthread_detach(th);
